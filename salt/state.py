@@ -88,7 +88,8 @@ STATE_RUNTIME_KEYWORDS = frozenset([
     'prereq',
     'prereq_in',
     'prerequired',
-    'reload_modules',
+    '
+    ',
     'reload_grains',
     'reload_pillar',
     'fire_event',
@@ -937,12 +938,12 @@ class State(object):
             self.opts['pillar'] = self._gather_pillar()
             _reload_modules = True
 
+        if not ret['changes']:
+            return
+
         if data.get('reload_modules', False) or _reload_modules:
             # User explicitly requests a reload
             self.module_refresh()
-            return
-
-        if not ret['changes']:
             return
 
         if data['state'] == 'file':
