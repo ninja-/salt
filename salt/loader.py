@@ -28,6 +28,7 @@ import salt.utils.context
 import salt.utils.lazy
 import salt.utils.event
 import salt.utils.odict
+import time
 
 # Solve the Chicken and egg problem where grains need to run before any
 # of the modules are loaded and are generally available for any usage.
@@ -35,6 +36,8 @@ import salt.modules.cmdmod
 
 # Import 3rd-party libs
 import salt.ext.six as six
+from salt.ext.six.moves import reload_module
+import traceback
 try:
     import pkg_resources
     HAS_PKG_RESOURCES = True
@@ -429,7 +432,7 @@ def fileserver(opts, backends):
                       pack={'__utils__': utils(opts)})
 
 
-def roster(opts, whitelist=None):
+def roster(opts, runner, whitelist=None):
     '''
     Returns the roster modules
     '''
@@ -438,6 +441,7 @@ def roster(opts, whitelist=None):
         opts,
         tag='roster',
         whitelist=whitelist,
+        pack={'__runner__': runner},
     )
 
 
@@ -739,7 +743,7 @@ def grains(opts, force_refresh=False, proxy=None):
         else:
             grains_data.update(ret)
 
-    if opts.get('proxy_merge_grains_in_module', False) and proxy:
+    if opts.get('proxy_merge_grains_in_module', True) and proxy:
         try:
             proxytype = proxy.opts['proxy']['proxytype']
             if proxytype+'.grains' in proxy:
@@ -1060,7 +1064,8 @@ class LazyLoader(salt.utils.lazy.LazyDict):
         # names of modules that we don't have (errors, __virtual__, etc.)
         self.missing_modules = {}  # mapping of name -> error
         self.loaded_modules = {}  # mapping of module_name -> dict_of_functions
-        self.loaded_files = set()  # TODO: just remove them from file_mapping?
+        self.loaded_files = {}  # TODO: just remove them from file_mapping?
+        self.deferred_modules = {} # mapping of virtualname -> realname like pkg -> [pacman, apt]...
         self.static_modules = static_modules if static_modules else []
 
         if virtual_funcs is None:
@@ -1227,8 +1232,12 @@ class LazyLoader(salt.utils.lazy.LazyDict):
         '''
         Clear the dict
         '''
+
+        #fuck = len(self.loaded_files) if self.loaded_files else 9
+        # log.exception("DERP: CLEAR CALLED!! loaded_files="+str(fuck))
+        #traceback.print_stack()
         super(LazyLoader, self).clear()  # clear the lazy loader
-        self.loaded_files = set()
+        self.loaded_files = {}
         self.missing_modules = {}
         self.loaded_modules = {}
         # if we have been loaded before, lets clear the file mapping since
@@ -1284,85 +1293,100 @@ class LazyLoader(salt.utils.lazy.LazyDict):
         for submodule in submodules:
             # it is a submodule if the name is in a namespace under mod
             if submodule.__name__.startswith(mod.__name__ + '.'):
-                reload(submodule)
+                reload_module(submodule)
                 self._reload_submodules(submodule)
 
-    def _load_module(self, name):
+    def _load_module(self, name, requested_name=None):
         mod = None
         fpath, suffix = self.file_mapping[name]
-        self.loaded_files.add(name)
-        fpath_dirname = os.path.dirname(fpath)
-        try:
-            sys.path.append(fpath_dirname)
-            if suffix == '.pyx':
-                mod = pyximport.load_module(name, fpath, tempfile.gettempdir())
-            elif suffix == '.o':
-                top_mod = __import__(fpath, globals(), locals(), [])
-                comps = fpath.split('.')
-                if len(comps) < 2:
-                    mod = top_mod
+
+
+
+
+        # File loading
+        file_loaded = name in self.loaded_files
+        if file_loaded:
+            mod = self.loaded_files[name]
+
+        if not file_loaded:
+            fpath_dirname = os.path.dirname(fpath)
+            try:
+                sys.path.append(fpath_dirname)
+                if suffix == '.pyx':
+                    mod = pyximport.load_module(name, fpath, tempfile.gettempdir())
+                elif suffix == '.o':
+                    top_mod = __import__(fpath, globals(), locals(), [])
+                    comps = fpath.split('.')
+                    if len(comps) < 2:
+                        mod = top_mod
+                    else:
+                        mod = top_mod
+                        for subname in comps[1:]:
+                            mod = getattr(mod, subname)
+                elif suffix == '.zip':
+                    mod = zipimporter(fpath).load_module(name)
                 else:
-                    mod = top_mod
-                    for subname in comps[1:]:
-                        mod = getattr(mod, subname)
-            elif suffix == '.zip':
-                mod = zipimporter(fpath).load_module(name)
-            else:
-                desc = self.suffix_map[suffix]
-                # if it is a directory, we don't open a file
-                if suffix == '':
-                    mod = imp.load_module(
-                        '{0}.{1}.{2}.{3}'.format(
-                            self.loaded_base_name,
-                            self.mod_type_check(fpath),
-                            self.tag,
-                            name
-                        ), None, fpath, desc)
-                    # reload all submodules if necessary
-                    if not self.initial_load:
-                        self._reload_submodules(mod)
-                else:
-                    with salt.utils.fopen(fpath, desc[1]) as fn_:
+                    desc = self.suffix_map[suffix]
+                    # if it is a directory, we don't open a file
+                    if suffix == '':
                         mod = imp.load_module(
                             '{0}.{1}.{2}.{3}'.format(
                                 self.loaded_base_name,
                                 self.mod_type_check(fpath),
                                 self.tag,
                                 name
-                            ), fn_, fpath, desc)
+                            ), None, fpath, desc)
+                        # reload all submodules if necessary
+                        if not self.initial_load:
+                            self._reload_submodules(mod)
+                    else:
+                        with salt.utils.fopen(fpath, desc[1]) as fn_:
+                            mod = imp.load_module(
+                                '{0}.{1}.{2}.{3}'.format(
+                                    self.loaded_base_name,
+                                    self.mod_type_check(fpath),
+                                    self.tag,
+                                    name
+                                ), fn_, fpath, desc)
 
-        except IOError:
-            raise
-        except ImportError as exc:
-            if 'magic number' in str(exc):
-                log.warning('Failed to import {0} {1}. Bad magic number. If migrating '
-                        'from Python2 to Python3, remove all .pyc files and try again.'.format(self.tag, name))
-            log.debug(
-                'Failed to import {0} {1}:\n'.format(
-                    self.tag, name
-                ),
-                exc_info=True
-            )
-            return False
-        except Exception as error:
-            log.error(
-                'Failed to import {0} {1}, this is due most likely to a '
-                'syntax error:\n'.format(
-                    self.tag, name
-                ),
-                exc_info=True
-            )
-            return False
-        except SystemExit:
-            log.error(
-                'Failed to import {0} {1} as the module called exit()\n'.format(
-                    self.tag, name
-                ),
-                exc_info=True
-            )
-            return False
-        finally:
-            sys.path.remove(fpath_dirname)
+            except IOError:
+                raise
+            except ImportError as exc:
+                if 'magic number' in str(exc):
+                    error_msg = 'Failed to import {0} {1}. Bad magic number. If migrating from Python2 to Python3, remove all .pyc files and try again.'.format(self.tag, name)
+                    log.warning(error_msg)
+                    self.missing_modules[name] = error_msg
+                log.debug(
+                    'Failed to import {0} {1}:\n'.format(
+                        self.tag, name
+                    ),
+                    exc_info=True
+                )
+                self.missing_modules[name] = exc
+                return False
+            except Exception as error:
+                log.error(
+                    'Failed to import {0} {1}, this is due most likely to a '
+                    'syntax error:\n'.format(
+                        self.tag, name
+                    ),
+                    exc_info=True
+                )
+                self.missing_modules[name] = error
+                return False
+            except SystemExit as error:
+                log.error(
+                    'Failed to import {0} {1} as the module called exit()\n'.format(
+                        self.tag, name
+                    ),
+                    exc_info=True
+                )
+                self.missing_modules[name] = error
+                return False
+            finally:
+                sys.path.remove(fpath_dirname)
+                self.loaded_files[name] = mod
+
 
         if hasattr(mod, '__opts__'):
             mod.__opts__.update(self.opts)
@@ -1373,10 +1397,35 @@ class LazyLoader(salt.utils.lazy.LazyDict):
         for p_name, p_value in six.iteritems(self.pack):
             setattr(mod, p_name, p_value)
 
-        module_name = mod.__name__.rsplit('.', 1)[-1]
+        module_name = mod.__name__.rsplit('.', 1)[-1] # !! THIS IS EXACTLY THE SAME as 'name' - ALWAYS !!
 
+        virtual_name = getattr(mod, '__virtualname__', module_name)
+        # requested: pkg
+        # module_name: (!) pacman
+        # virtual_name: pkg
+        # true and pacman != pkg and 
+
+        if requested_name != None and (virtual_name != requested_name and module_name != requested_name):
+            # Not what we were looking for...so let's cache that for later...and totally don't load
+            # this handles both virtual_name != module_name and virtual_name == module_name
+            # so service = [service, systemd.....]
+           # log.info("DERP: wtf virtual " + module_name + "(" + virtual_name + ")" + " != " + requested_name)
+            self.deferred_modules.setdefault(virtual_name, [])
+            self.deferred_modules[virtual_name].append(module_name)
+           # log.info("DERP: wtf virtual ? " + virtual_name + " xd -> " + str(self.deferred_modules[virtual_name]))
+           # if module_name == "systemd":
+           #     log.info("co do chuja systemd ? service -> " + str(self.deferred_modules[virtual_name]))
+            return False
+
+                # return True # deferring load_module
+
+        #log.info("DERP: loading module " + module_name + " and " + str(requested_name))
+        return self._load_module_finish(mod, module_name, requested_name)
+
+    def _load_module_finish(self, mod, module_name, requested_name):
         # Call a module's initialization method if it exists
         module_init = getattr(mod, '__init__', None)
+        name = module_name
         if inspect.isfunction(module_init):
             try:
                 module_init(self.opts)
@@ -1415,6 +1464,7 @@ class LazyLoader(salt.utils.lazy.LazyDict):
                     # If a module has information about why it could not be loaded, record it
                     self.missing_modules[module_name] = virtual_err
                     self.missing_modules[name] = virtual_err
+                if virtual_ret is not True:
                     return False
 
         # If this is a proxy minion then MOST modules cannot work. Therefore, require that
@@ -1483,6 +1533,9 @@ class LazyLoader(salt.utils.lazy.LazyDict):
         self.loaded_modules[module_name] = mod_dict
         return True
 
+    total_truck = 0
+    total_init = 0
+
     def _load(self, key):
         '''
         Load a single item if you have it
@@ -1498,12 +1551,46 @@ class LazyLoader(salt.utils.lazy.LazyDict):
             raise KeyError
 
         def _inner_load(mod_name):
+         #   log.info("DERP DEF!! : " + mod_name + " " + str(self.deferred_modules or "none"))
+            has_deferred = mod_name in self.deferred_modules
+            if has_deferred:
+          #      log.info("DERP DEFERRED: " + mod_name + " any ? " + str(self.deferred_modules[mod_name])  )
+                # Try again to load the modules, but with the right name :)
+                start_time = time.time()
+                for deferred in self.deferred_modules[mod_name]:
+           #         log.info("DERP: wtf loading " + deferred + " as for " + mod_name)
+            #        log.info("DERP: dla " + mod_name + " systemd kurwa? " + str("systemd" in self.loaded_files))
+                    if self._load_module(deferred, mod_name) and key in self._dict:
+             #           log.info("DERP: wtf finished " + mod_name + " = " + deferred)
+                        return True
+              #      log.info("DERP: everything failed for " + mod_name + ", tried " + str(self.deferred_modules[mod_name]))
+                LazyLoader.total_init += time.time()-start_time
+              #  log.info("DERP: total init " + str(LazyLoader.total_init))
+
+            # else:
+              #  log.info("DERP: everything failed for " + mod_name)                    
+
+            i = 0
+           # start_time = time.time()
+
             for name in self._iter_files(mod_name):
                 if name in self.loaded_files:
                     continue
+            #    i += 1
+
                 # if we got what we wanted, we are done
-                if self._load_module(name) and key in self._dict:
-                    return True
+                self._load_module(name, mod_name)
+                # if key in self._dict:
+                #     return True
+
+                #    return True
+
+          #  LazyLoader.total_truck += time.time()-start_time
+            #log.info("DERP: got hit by a truck times " + str(i) + " sec="+ str(time.time() - start_time))
+            # log.info("DERP: total truck " + str(LazyLoader.total_truck))
+            if key in self._dict:
+                return True
+
             return False
 
         # try to load the module
