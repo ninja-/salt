@@ -1524,9 +1524,6 @@ class LazyLoader(salt.utils.lazy.LazyDict):
         self.loaded_modules[module_name] = mod_dict
         return True
 
-    total_truck = 0
-    total_init = 0
-
     def _load(self, key):
         '''
         Load a single item if you have it
@@ -1549,19 +1546,15 @@ class LazyLoader(salt.utils.lazy.LazyDict):
                 for deferred in self.deferred_modules[mod_name]:
                     if self._load_module(deferred, mod_name) and key in self._dict:
                         return True
-                LazyLoader.total_init += time.time()-start_time
-              #  log.info("xxx: total init " + str(LazyLoader.total_init))
 
             # else:
               #  log.info("xxx: everything failed for " + mod_name)                    
 
-            i = 0
            # start_time = time.time()
 
             for name in self._iter_files(mod_name):
                 if name in self.loaded_files:
                     continue
-            #    i += 1
 
                 # if we got what we wanted, we are done
                 self._load_module(name, mod_name)
@@ -1569,10 +1562,6 @@ class LazyLoader(salt.utils.lazy.LazyDict):
                 #     return True
                 # This is commented out so it will cache all module names on FIRST CALL
                 #    return True
-
-          #  LazyLoader.total_truck += time.time()-start_time
-            #log.info("xxx: got hit by a truck times " + str(i) + " sec="+ str(time.time() - start_time))
-            # log.info("xxx: total truck " + str(LazyLoader.total_truck))
             if key in self._dict:
                 return True
 
