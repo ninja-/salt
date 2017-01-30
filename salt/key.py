@@ -1,1433 +1,1765 @@
 # -*- coding: utf-8 -*-
 '''
-The Salt Key backend API and interface used by the CLI. The Key class can be
-used to manage salt keys directly without interfacing with the CLI.
+The Salt loader is the core to Salt's plugin system, the loader scans
+directories for python loadable code and organizes the code into the
+plugin interfaces used by Salt.
 '''
 
 # Import python libs
-from __future__ import absolute_import, print_function
+from __future__ import absolute_import
 import os
-import copy
-import json
-import stat
-import shutil
-import fnmatch
-import hashlib
+import imp
+import sys
+import salt
+import time
 import logging
+import inspect
+import tempfile
+import functools
+from collections import MutableMapping
+from zipimport import zipimporter
 
 # Import salt libs
-import salt.cache
-import salt.client
-import salt.crypt
-import salt.daemons.masterapi
-import salt.exceptions
-import salt.minion
-import salt.utils
+from salt.exceptions import LoaderError
+from salt.template import check_render_pipe_str
+from salt.utils.decorators import Depends
+from salt.utils import is_proxy
+import salt.utils.context
+import salt.utils.lazy
 import salt.utils.event
-import salt.utils.kinds
+import salt.utils.odict
+import time
 
-# pylint: disable=import-error,no-name-in-module,redefined-builtin
+# Solve the Chicken and egg problem where grains need to run before any
+# of the modules are loaded and are generally available for any usage.
+import salt.modules.cmdmod
+
+# Import 3rd-party libs
 import salt.ext.six as six
-from salt.ext.six.moves import input
-# pylint: enable=import-error,no-name-in-module,redefined-builtin
-
-# Import third party libs
+from salt.ext.six.moves import reload_module
+import traceback
 try:
-    import msgpack
+    import pkg_resources
+    HAS_PKG_RESOURCES = True
 except ImportError:
-    pass
+    HAS_PKG_RESOURCES = False
 
+__salt__ = {
+    'cmd.run': salt.modules.cmdmod._run_quiet
+}
 log = logging.getLogger(__name__)
 
+SALT_BASE_PATH = os.path.abspath(os.path.dirname(salt.__file__))
+LOADED_BASE_NAME = 'salt.loaded'
 
-def get_key(opts):
-    if opts['transport'] in ('zeromq', 'tcp'):
-        return Key(opts)
-    else:
-        return RaetKey(opts)
+if six.PY3:
+    # pylint: disable=no-member,no-name-in-module,import-error
+    import importlib.machinery
+    SUFFIXES = []
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        SUFFIXES.append((suffix, 'rb', 3))
+    for suffix in importlib.machinery.BYTECODE_SUFFIXES:
+        SUFFIXES.append((suffix, 'rb', 2))
+    for suffix in importlib.machinery.SOURCE_SUFFIXES:
+        SUFFIXES.append((suffix, 'r', 1))
+    # pylint: enable=no-member,no-name-in-module,import-error
+else:
+    SUFFIXES = imp.get_suffixes()
+
+# Because on the cloud drivers we do `from salt.cloud.libcloudfuncs import *`
+# which simplifies code readability, it adds some unsupported functions into
+# the driver's module scope.
+# We list un-supported functions here. These will be removed from the loaded.
+LIBCLOUD_FUNCS_NOT_SUPPORTED = (
+    'parallels.avail_sizes',
+    'parallels.avail_locations',
+    'proxmox.avail_sizes',
+    'saltify.destroy',
+    'saltify.avail_sizes',
+    'saltify.avail_images',
+    'saltify.avail_locations',
+    'rackspace.reboot',
+    'openstack.list_locations',
+    'rackspace.list_locations'
+)
+
+# Will be set to pyximport module at runtime if cython is enabled in config.
+pyximport = None
 
 
-class KeyCLI(object):
+def static_loader(
+        opts,
+        ext_type,
+        tag,
+        pack=None,
+        int_type=None,
+        ext_dirs=True,
+        ext_type_dirs=None,
+        base_path=None,
+        filter_name=None,
+        ):
+    funcs = LazyLoader(
+        _module_dirs(
+            opts,
+            ext_type,
+            tag,
+            int_type,
+            ext_dirs,
+            ext_type_dirs,
+            base_path,
+        ),
+        opts,
+        tag=tag,
+        pack=pack,
+    )
+    ret = {}
+    funcs._load_all()
+    if filter_name:
+        funcs = FilterDictWrapper(funcs, filter_name)
+    for key in funcs:
+        ret[key] = funcs[key]
+    return ret
+
+
+def _module_dirs(
+        opts,
+        ext_type,
+        tag=None,
+        int_type=None,
+        ext_dirs=True,
+        ext_type_dirs=None,
+        base_path=None,
+        ):
+    if tag is None:
+        tag = ext_type
+    sys_types = os.path.join(base_path or SALT_BASE_PATH, int_type or ext_type)
+    ext_types = os.path.join(opts['extension_modules'], ext_type)
+
+    ext_type_types = []
+    if ext_dirs:
+        if ext_type_dirs is None:
+            ext_type_dirs = '{0}_dirs'.format(tag)
+        if ext_type_dirs in opts:
+            ext_type_types.extend(opts[ext_type_dirs])
+        if HAS_PKG_RESOURCES and ext_type_dirs:
+            for entry_point in pkg_resources.iter_entry_points('salt.loader', ext_type_dirs):
+                loaded_entry_point = entry_point.load()
+                for path in loaded_entry_point():
+                    ext_type_types.append(path)
+
+    cli_module_dirs = []
+    # The dirs can be any module dir, or a in-tree _{ext_type} dir
+    for _dir in opts.get('module_dirs', []):
+        # Prepend to the list to match cli argument ordering
+        maybe_dir = os.path.join(_dir, ext_type)
+        if os.path.isdir(maybe_dir):
+            cli_module_dirs.insert(0, maybe_dir)
+            continue
+
+        maybe_dir = os.path.join(_dir, '_{0}'.format(ext_type))
+        if os.path.isdir(maybe_dir):
+            cli_module_dirs.insert(0, maybe_dir)
+
+    return cli_module_dirs + ext_type_types + [ext_types, sys_types]
+
+
+def minion_mods(
+        opts,
+        context=None,
+        utils=None,
+        whitelist=None,
+        initial_load=False,
+        loaded_base_name=None,
+        notify=False,
+        static_modules=None,
+        proxy=None):
     '''
-    Manage key CLI operations
+    Load execution modules
+
+    Returns a dictionary of execution modules appropriate for the current
+    system by evaluating the __virtual__() function in each module.
+
+    :param dict opts: The Salt options dictionary
+
+    :param dict context: A Salt context that should be made present inside
+                            generated modules in __context__
+
+    :param dict utils: Utility functions which should be made available to
+                            Salt modules in __utils__. See `utils_dir` in
+                            salt.config for additional information about
+                            configuration.
+
+    :param list whitelist: A list of modules which should be whitelisted.
+    :param bool initial_load: Deprecated flag! Unused.
+    :param str loaded_base_name: A string marker for the loaded base name.
+    :param bool notify: Flag indicating that an event should be fired upon
+                        completion of module loading.
+
+    .. code-block:: python
+
+        import salt.config
+        import salt.loader
+
+        __opts__ = salt.config.minion_config('/etc/salt/minion')
+        __grains__ = salt.loader.grains(__opts__)
+        __opts__['grains'] = __grains__
+        __utils__ = salt.loader.utils(__opts__)
+        __salt__ = salt.loader.minion_mods(__opts__, utils=__utils__)
+        __salt__['test.ping']()
     '''
-    CLI_KEY_MAP = {'list': 'list_status',
-                   'delete': 'delete_key',
-                   'gen_signature': 'gen_keys_signature',
-                   'print': 'key_str',
-                   }
+    # TODO Publish documentation for module whitelisting
+    if not whitelist:
+        whitelist = opts.get('whitelist_modules', None)
+    ret = LazyLoader(
+        _module_dirs(opts, 'modules', 'module'),
+        opts,
+        tag='module',
+        pack={'__context__': context, '__utils__': utils, '__proxy__': proxy},
+        whitelist=whitelist,
+        loaded_base_name=loaded_base_name,
+        static_modules=static_modules,
+    )
 
-    def __init__(self, opts):
-        self.opts = opts
-        self.client = salt.wheel.WheelClient(opts)
-        if self.opts['transport'] in ('zeromq', 'tcp'):
-            self.key = Key
-        else:
-            self.key = RaetKey
-        # instantiate the key object for masterless mode
-        if not opts.get('eauth'):
-            self.key = self.key(opts)
-        self.auth = None
+    ret.pack['__salt__'] = ret
 
-    def _update_opts(self):
-        # get the key command
-        for cmd in ('gen_keys',
-                    'gen_signature',
-                    'list',
-                    'list_all',
-                    'print',
-                    'print_all',
-                    'accept',
-                    'accept_all',
-                    'reject',
-                    'reject_all',
-                    'delete',
-                    'delete_all',
-                    'finger',
-                    'finger_all',
-                    'list_all'):  # last is default
-            if self.opts[cmd]:
+    # Load any provider overrides from the configuration file providers option
+    #  Note: Providers can be pkg, service, user or group - not to be confused
+    #        with cloud providers.
+    providers = opts.get('providers', False)
+    if providers and isinstance(providers, dict):
+        for mod in providers:
+            # sometimes providers opts is not to diverge modules but
+            # for other configuration
+            try:
+                funcs = raw_mod(opts, providers[mod], ret)
+            except TypeError:
                 break
-        # set match if needed
-        if not cmd.startswith('gen_'):
-            if cmd == 'list_all':
-                self.opts['match'] = 'all'
-            elif cmd.endswith('_all'):
-                self.opts['match'] = '*'
             else:
-                self.opts['match'] = self.opts[cmd]
-            if cmd.startswith('accept'):
-                self.opts['include_rejected'] = self.opts['include_all'] or self.opts['include_rejected']
-                self.opts['include_accepted'] = False
-            elif cmd.startswith('reject'):
-                self.opts['include_accepted'] = self.opts['include_all'] or self.opts['include_accepted']
-                self.opts['include_rejected'] = False
-        elif cmd == 'gen_keys':
-            self.opts['keydir'] = self.opts['gen_keys_dir']
-            self.opts['keyname'] = self.opts['gen_keys']
-        # match is set to opts, now we can forget about *_all commands
-        self.opts['fun'] = cmd.replace('_all', '')
+                if funcs:
+                    for func in funcs:
+                        f_key = '{0}{1}'.format(mod, func[func.rindex('.'):])
+                        ret[f_key] = funcs[func]
 
-    def _init_auth(self):
-        if self.auth:
-            return
+    if notify:
+        evt = salt.utils.event.get_event('minion', opts=opts, listen=False)
+        evt.fire_event({'complete': True}, tag='/salt/minion/minion_mod_complete')
 
-        low = {}
-        skip_perm_errors = self.opts['eauth'] != ''
+    return ret
 
-        if self.opts['eauth']:
-            if 'token' in self.opts:
-                try:
-                    with salt.utils.fopen(os.path.join(self.opts['cachedir'], '.root_key'), 'r') as fp_:
-                        low['key'] = fp_.readline()
-                except IOError:
-                    low['token'] = self.opts['token']
-            #
-            # If using eauth and a token hasn't already been loaded into
-            # low, prompt the user to enter auth credentials
-            if 'token' not in low and 'key' not in low and self.opts['eauth']:
-                # This is expensive. Don't do it unless we need to.
-                resolver = salt.auth.Resolver(self.opts)
-                res = resolver.cli(self.opts['eauth'])
-                if self.opts['mktoken'] and res:
-                    tok = resolver.token_cli(
-                            self.opts['eauth'],
-                            res
-                            )
-                    if tok:
-                        low['token'] = tok.get('token', '')
-                if not res:
-                    log.error('Authentication failed')
-                    return {}
-                low.update(res)
-                low['eauth'] = self.opts['eauth']
-        else:
-            low['user'] = salt.utils.get_specific_user()
-            low['key'] = salt.utils.get_master_key(low['user'], self.opts, skip_perm_errors)
 
-        self.auth = low
+def raw_mod(opts, name, functions, mod='modules'):
+    '''
+    Returns a single module loaded raw and bypassing the __virtual__ function
 
-    def _get_args_kwargs(self, fun, args=None):
-        if args is None:
-            argspec = salt.utils.args.get_function_argspec(fun)
-            args = []
-            if argspec.args:
-                for arg in argspec.args:
-                    args.append(self.opts.get(arg))
-        args, kwargs = salt.minion.load_args_and_kwargs(
-            fun,
-            args,
-            self.opts,
-        )
-        return args, kwargs
+    .. code-block:: python
 
-    def _run_cmd(self, cmd, args=None):
-        if not self.opts.get('eauth'):
-            cmd = self.CLI_KEY_MAP.get(cmd, cmd)
-            fun = getattr(self.key, cmd)
-            args, kwargs = self._get_args_kwargs(fun, args)
-            ret = fun(*args, **kwargs)
-            if (isinstance(ret, dict) and 'local' in ret and
-                        cmd not in ('finger', 'finger_all')):
-                ret.pop('local', None)
-            return ret
+        import salt.config
+        import salt.loader
 
-        fstr = 'key.{0}'.format(cmd)
-        fun = self.client.functions[fstr]
-        args, kwargs = self._get_args_kwargs(fun, args)
+        __opts__ = salt.config.minion_config('/etc/salt/minion')
+        testmod = salt.loader.raw_mod(__opts__, 'test', None)
+        testmod['test.ping']()
+    '''
+    loader = LazyLoader(
+        _module_dirs(opts, mod, 'rawmodule'),
+        opts,
+        tag='rawmodule',
+        virtual_enable=False,
+        pack={'__salt__': functions},
+    )
+    # if we don't have the module, return an empty dict
+    if name not in loader.file_mapping:
+        return {}
 
-        low = {
-                'fun': fstr,
-                'arg': args,
-                'kwarg': kwargs,
-                }
+    loader._load_module(name)  # load a single module (the one passed in)
+    return dict(loader._dict)  # return a copy of *just* the funcs for `name`
 
-        self._init_auth()
-        low.update(self.auth)
 
-        # Execute the key request!
-        ret = self.client.cmd_sync(low)
+def engines(opts, functions, runners, proxy=None):
+    '''
+    Return the master services plugins
+    '''
+    pack = {'__salt__': functions,
+            '__runners__': runners,
+            '__proxy__': proxy}
+    return LazyLoader(
+        _module_dirs(opts, 'engines'),
+        opts,
+        tag='engines',
+        pack=pack,
+    )
 
-        ret = ret['data']['return']
-        if (isinstance(ret, dict) and 'local' in ret and
-                cmd not in ('finger', 'finger_all')):
-            ret.pop('local', None)
 
-        return ret
+def proxy(opts, functions=None, returners=None, whitelist=None, utils=None):
+    '''
+    Returns the proxy module for this salt-proxy-minion
+    '''
+    ret = LazyLoader(
+        _module_dirs(opts, 'proxy'),
+        opts,
+        tag='proxy',
+        pack={'__salt__': functions, '__ret__': returners, '__utils__': utils},
+    )
 
-    def _filter_ret(self, cmd, ret):
-        if cmd.startswith('delete'):
-            return ret
+    ret.pack['__proxy__'] = ret
 
-        keys = {}
-        if self.key.PEND in ret:
-            keys[self.key.PEND] = ret[self.key.PEND]
-        if self.opts['include_accepted'] and bool(ret.get(self.key.ACC)):
-            keys[self.key.ACC] = ret[self.key.ACC]
-        if self.opts['include_rejected'] and bool(ret.get(self.key.REJ)):
-            keys[self.key.REJ] = ret[self.key.REJ]
-        if self.opts['include_denied'] and bool(ret.get(self.key.DEN)):
-            keys[self.key.DEN] = ret[self.key.DEN]
-        return keys
+    return ret
 
-    def _print_no_match(self, cmd, match):
-        statuses = ['unaccepted']
-        if self.opts['include_accepted']:
-            statuses.append('accepted')
-        if self.opts['include_rejected']:
-            statuses.append('rejected')
-        if self.opts['include_denied']:
-            statuses.append('denied')
-        if len(statuses) == 1:
-            stat_str = statuses[0]
-        else:
-            stat_str = '{0} or {1}'.format(', '.join(statuses[:-1]), statuses[-1])
-        msg = 'The key glob \'{0}\' does not match any {1} keys.'.format(match, stat_str)
-        print(msg)
 
-    def run(self):
-        '''
-        Run the logic for saltkey
-        '''
-        self._update_opts()
-        cmd = self.opts['fun']
+def returners(opts, functions, whitelist=None, context=None, proxy=None):
+    '''
+    Returns the returner modules
+    '''
+    return LazyLoader(
+        _module_dirs(opts, 'returners', 'returner'),
+        opts,
+        tag='returner',
+        whitelist=whitelist,
+        pack={'__salt__': functions, '__context__': context, '__proxy__': proxy or {}},
+    )
 
-        veri = None
-        ret = None
-        try:
-            if cmd in ('accept', 'reject', 'delete'):
-                ret = self._run_cmd('name_match')
-                if not isinstance(ret, dict):
-                    salt.output.display_output(ret, 'key', opts=self.opts)
-                    return ret
-                ret = self._filter_ret(cmd, ret)
-                if not ret:
-                    self._print_no_match(cmd, self.opts['match'])
-                    return
-                print('The following keys are going to be {0}ed:'.format(cmd.rstrip('e')))
-                salt.output.display_output(ret, 'key', opts=self.opts)
 
-                if not self.opts.get('yes', False):
+def utils(opts, whitelist=None, context=None, proxy=proxy):
+    '''
+    Returns the utility modules
+    '''
+    return LazyLoader(
+        _module_dirs(opts, 'utils', ext_type_dirs='utils_dirs'),
+        opts,
+        tag='utils',
+        whitelist=whitelist,
+        pack={'__context__': context, '__proxy__': proxy or {}},
+    )
+
+
+def pillars(opts, functions, context=None):
+    '''
+    Returns the pillars modules
+    '''
+    ret = LazyLoader(_module_dirs(opts, 'pillar'),
+                     opts,
+                     tag='pillar',
+                     pack={'__salt__': functions,
+                           '__context__': context,
+                           '__utils__': utils(opts)})
+    ret.pack['__ext_pillar__'] = ret
+    return FilterDictWrapper(ret, '.ext_pillar')
+
+
+def tops(opts):
+    '''
+    Returns the tops modules
+    '''
+    if 'master_tops' not in opts:
+        return {}
+    whitelist = list(opts['master_tops'].keys())
+    ret = LazyLoader(
+        _module_dirs(opts, 'tops', 'top'),
+        opts,
+        tag='top',
+        whitelist=whitelist,
+    )
+    return FilterDictWrapper(ret, '.top')
+
+
+def wheels(opts, whitelist=None):
+    '''
+    Returns the wheels modules
+    '''
+    return LazyLoader(
+        _module_dirs(opts, 'wheel'),
+        opts,
+        tag='wheel',
+        whitelist=whitelist,
+    )
+
+
+def outputters(opts):
+    '''
+    Returns the outputters modules
+
+    :param dict opts: The Salt options dictionary
+    :returns: LazyLoader instance, with only outputters present in the keyspace
+    '''
+    ret = LazyLoader(
+        _module_dirs(opts, 'output', ext_type_dirs='outputter_dirs'),
+        opts,
+        tag='output',
+    )
+    wrapped_ret = FilterDictWrapper(ret, '.output')
+    # TODO: this name seems terrible... __salt__ should always be execution mods
+    ret.pack['__salt__'] = wrapped_ret
+    return wrapped_ret
+
+
+def serializers(opts):
+    '''
+    Returns the serializers modules
+    :param dict opts: The Salt options dictionary
+    :returns: LazyLoader instance, with only serializers present in the keyspace
+    '''
+    return LazyLoader(
+        _module_dirs(opts, 'serializers'),
+        opts,
+        tag='serializers',
+    )
+
+
+def auth(opts, whitelist=None):
+    '''
+    Returns the auth modules
+
+    :param dict opts: The Salt options dictionary
+    :returns: LazyLoader
+    '''
+    return LazyLoader(
+        _module_dirs(opts, 'auth'),
+        opts,
+        tag='auth',
+        whitelist=whitelist,
+        pack={'__salt__': minion_mods(opts)},
+    )
+
+
+def fileserver(opts, backends):
+    '''
+    Returns the file server modules
+    '''
+    return LazyLoader(_module_dirs(opts, 'fileserver'),
+                      opts,
+                      tag='fileserver',
+                      whitelist=backends,
+                      pack={'__utils__': utils(opts)})
+
+
+def roster(opts, runner, whitelist=None):
+    '''
+    Returns the roster modules
+    '''
+    return LazyLoader(
+        _module_dirs(opts, 'roster'),
+        opts,
+        tag='roster',
+        whitelist=whitelist,
+        pack={'__runner__': runner},
+    )
+
+
+def thorium(opts, functions, runners):
+    '''
+    Load the thorium runtime modules
+    '''
+    pack = {'__salt__': functions, '__runner__': runners, '__context__': {}}
+    ret = LazyLoader(_module_dirs(opts, 'thorium'),
+            opts,
+            tag='thorium',
+            pack=pack)
+    ret.pack['__thorium__'] = ret
+    return ret
+
+
+def states(opts, functions, utils, serializers, whitelist=None, proxy=None):
+    '''
+    Returns the state modules
+
+    :param dict opts: The Salt options dictionary
+    :param dict functions: A dictionary of minion modules, with module names as
+                            keys and funcs as values.
+
+    .. code-block:: python
+
+        import salt.config
+        import salt.loader
+
+        __opts__ = salt.config.minion_config('/etc/salt/minion')
+        statemods = salt.loader.states(__opts__, None, None)
+    '''
+    ret = LazyLoader(
+        _module_dirs(opts, 'states'),
+        opts,
+        tag='states',
+        pack={'__salt__': functions, '__proxy__': proxy or {}},
+        whitelist=whitelist,
+    )
+    ret.pack['__states__'] = ret
+    ret.pack['__utils__'] = utils
+    ret.pack['__serializers__'] = serializers
+    return ret
+
+
+def beacons(opts, functions, context=None, proxy=None):
+    '''
+    Load the beacon modules
+
+    :param dict opts: The Salt options dictionary
+    :param dict functions: A dictionary of minion modules, with module names as
+                            keys and funcs as values.
+    '''
+    return LazyLoader(
+        _module_dirs(opts, 'beacons'),
+        opts,
+        tag='beacons',
+        virtual_funcs=['__validate__'],
+        pack={'__context__': context, '__salt__': functions, '__proxy__': proxy or {}},
+    )
+
+
+def search(opts, returners, whitelist=None):
+    '''
+    Returns the search modules
+
+    :param dict opts: The Salt options dictionary
+    :param returners: Undocumented
+    :param whitelist: Undocumented
+    '''
+    # TODO Document returners arg
+    # TODO Document whitelist arg
+    return LazyLoader(
+        _module_dirs(opts, 'search', 'search'),
+        opts,
+        tag='search',
+        whitelist=whitelist,
+        pack={'__ret__': returners},
+    )
+
+
+def log_handlers(opts):
+    '''
+    Returns the custom logging handler modules
+
+    :param dict opts: The Salt options dictionary
+    '''
+    ret = LazyLoader(
+        _module_dirs(
+            opts,
+            'log_handlers',
+            int_type='handlers',
+            base_path=os.path.join(SALT_BASE_PATH, 'log'),
+        ),
+        opts,
+        tag='log_handlers',
+    )
+    return FilterDictWrapper(ret, '.setup_handlers')
+
+
+def ssh_wrapper(opts, functions=None, context=None):
+    '''
+    Returns the custom logging handler modules
+    '''
+    return LazyLoader(
+        _module_dirs(
+            opts,
+            'wrapper',
+            base_path=os.path.join(SALT_BASE_PATH, os.path.join('client', 'ssh')),
+        ),
+        opts,
+        tag='wrapper',
+        pack={
+            '__salt__': functions,
+            '__grains__': opts.get('grains', {}),
+            '__pillar__': opts.get('pillar', {}),
+            '__context__': context,
+            },
+    )
+
+
+def render(opts, functions, states=None):
+    '''
+    Returns the render modules
+    '''
+    pack = {'__salt__': functions,
+            '__grains__': opts.get('grains', {})}
+    if states:
+        pack['__states__'] = states
+    ret = LazyLoader(
+        _module_dirs(
+            opts,
+            'renderers',
+            'render',
+            ext_type_dirs='render_dirs',
+        ),
+        opts,
+        tag='render',
+        pack=pack,
+    )
+    rend = FilterDictWrapper(ret, '.render')
+
+    if not check_render_pipe_str(opts['renderer'], rend, opts['renderer_blacklist'], opts['renderer_whitelist']):
+        err = ('The renderer {0} is unavailable, this error is often because '
+               'the needed software is unavailable'.format(opts['renderer']))
+        log.critical(err)
+        raise LoaderError(err)
+    return rend
+
+
+def grain_funcs(opts, proxy=None):
+    '''
+    Returns the grain functions
+
+      .. code-block:: python
+
+          import salt.config
+          import salt.loader
+
+          __opts__ = salt.config.minion_config('/etc/salt/minion')
+          grainfuncs = salt.loader.grain_funcs(__opts__)
+    '''
+    return LazyLoader(
+        _module_dirs(
+            opts,
+            'grains',
+            'grain',
+            ext_type_dirs='grains_dirs',
+        ),
+        opts,
+        tag='grains',
+    )
+
+
+def grains(opts, force_refresh=False, proxy=None):
+    '''
+    Return the functions for the dynamic grains and the values for the static
+    grains.
+
+    Since grains are computed early in the startup process, grains functions
+    do not have __salt__ or __proxy__ available.  At proxy-minion startup,
+    this function is called with the proxymodule LazyLoader object so grains
+    functions can communicate with their controlled device.
+
+    .. code-block:: python
+
+        import salt.config
+        import salt.loader
+
+        __opts__ = salt.config.minion_config('/etc/salt/minion')
+        __grains__ = salt.loader.grains(__opts__)
+        print __grains__['id']
+    '''
+    # if we have no grains, lets try loading from disk (TODO: move to decorator?)
+    cfn = os.path.join(
+        opts['cachedir'],
+        'grains.cache.p'
+    )
+    if not force_refresh:
+        if opts.get('grains_cache', False):
+            if os.path.isfile(cfn):
+                grains_cache_age = int(time.time() - os.path.getmtime(cfn))
+                if opts.get('grains_cache_expiration', 300) >= grains_cache_age and not \
+                        opts.get('refresh_grains_cache', False) and not force_refresh:
+                    log.debug('Retrieving grains from cache')
                     try:
-                        if cmd.startswith('delete'):
-                            veri = input('Proceed? [N/y] ')
-                            if not veri:
-                                veri = 'n'
-                        else:
-                            veri = input('Proceed? [n/Y] ')
-                            if not veri:
-                                veri = 'y'
-                    except KeyboardInterrupt:
-                        raise SystemExit("\nExiting on CTRL-c")
-                # accept/reject/delete the same keys we're printed to the user
-                self.opts['match_dict'] = ret
-                self.opts.pop('match', None)
-                list_ret = ret
-
-            if veri is None or veri.lower().startswith('y'):
-                ret = self._run_cmd(cmd)
-                if cmd in ('accept', 'reject', 'delete'):
-                    if cmd == 'delete':
-                        ret = list_ret
-                    for minions in ret.values():
-                        for minion in minions:
-                            print('Key for minion {0} {1}ed.'.format(minion, cmd))
-                elif isinstance(ret, dict):
-                    salt.output.display_output(ret, 'key', opts=self.opts)
+                        serial = salt.payload.Serial(opts)
+                        with salt.utils.fopen(cfn, 'rb') as fp_:
+                            cached_grains = serial.load(fp_)
+                        return cached_grains
+                    except (IOError, OSError):
+                        pass
                 else:
-                    salt.output.display_output({'return': ret}, 'key', opts=self.opts)
-        except salt.exceptions.SaltException as exc:
-            ret = '{0}'.format(exc)
-            if not self.opts.get('quiet', False):
-                salt.output.display_output(ret, 'nested', self.opts)
-        return ret
-
-
-class MultiKeyCLI(KeyCLI):
-    '''
-    Manage multiple key backends from the CLI
-    '''
-    def __init__(self, opts):
-        opts['__multi_key'] = True
-        super(MultiKeyCLI, self).__init__(opts)
-        # Remove the key attribute set in KeyCLI.__init__
-        delattr(self, 'key')
-        zopts = copy.copy(opts)
-        ropts = copy.copy(opts)
-        self.keys = {}
-        zopts['transport'] = 'zeromq'
-        self.keys['ZMQ Keys'] = KeyCLI(zopts)
-        ropts['transport'] = 'raet'
-        self.keys['RAET Keys'] = KeyCLI(ropts)
-
-    def _call_all(self, fun, *args):
-        '''
-        Call the given function on all backend keys
-        '''
-        for kback in self.keys:
-            print(kback)
-            getattr(self.keys[kback], fun)(*args)
-
-    def list_status(self, status):
-        self._call_all('list_status', status)
-
-    def list_all(self):
-        self._call_all('list_all')
-
-    def accept(self, match, include_rejected=False, include_denied=False):
-        self._call_all('accept', match, include_rejected, include_denied)
-
-    def accept_all(self, include_rejected=False, include_denied=False):
-        self._call_all('accept_all', include_rejected, include_denied)
-
-    def delete(self, match):
-        self._call_all('delete', match)
-
-    def delete_all(self):
-        self._call_all('delete_all')
-
-    def reject(self, match, include_accepted=False, include_denied=False):
-        self._call_all('reject', match, include_accepted, include_denied)
-
-    def reject_all(self, include_accepted=False, include_denied=False):
-        self._call_all('reject_all', include_accepted, include_denied)
-
-    def print_key(self, match):
-        self._call_all('print_key', match)
-
-    def print_all(self):
-        self._call_all('print_all')
-
-    def finger(self, match, hash_type):
-        self._call_all('finger', match, hash_type)
-
-    def finger_all(self, hash_type):
-        self._call_all('finger_all', hash_type)
-
-    def prep_signature(self):
-        self._call_all('prep_signature')
-
-
-class Key(object):
-    '''
-    The object that encapsulates saltkey actions
-    '''
-    ACC = 'minions'
-    PEND = 'minions_pre'
-    REJ = 'minions_rejected'
-    DEN = 'minions_denied'
-
-    def __init__(self, opts, io_loop=None):
-        self.opts = opts
-        kind = self.opts.get('__role', '')  # application kind
-        if kind not in salt.utils.kinds.APPL_KINDS:
-            emsg = ("Invalid application kind = '{0}'.".format(kind))
-            log.error(emsg + '\n')
-            raise ValueError(emsg)
-        self.event = salt.utils.event.get_event(
-                kind,
-                opts['sock_dir'],
-                opts['transport'],
-                opts=opts,
-                listen=False,
-                io_loop=io_loop
-                )
-
-    def _check_minions_directories(self):
-        '''
-        Return the minion keys directory paths
-        '''
-        minions_accepted = os.path.join(self.opts['pki_dir'], self.ACC)
-        minions_pre = os.path.join(self.opts['pki_dir'], self.PEND)
-        minions_rejected = os.path.join(self.opts['pki_dir'],
-                                        self.REJ)
-
-        minions_denied = os.path.join(self.opts['pki_dir'],
-                                        self.DEN)
-        return minions_accepted, minions_pre, minions_rejected, minions_denied
-
-    def _get_key_attrs(self, keydir, keyname,
-                       keysize, user):
-        if not keydir:
-            if 'gen_keys_dir' in self.opts:
-                keydir = self.opts['gen_keys_dir']
-            else:
-                keydir = self.opts['pki_dir']
-        if not keyname:
-            if 'gen_keys' in self.opts:
-                keyname = self.opts['gen_keys']
-            else:
-                keyname = 'minion'
-        if not keysize:
-            keysize = self.opts['keysize']
-        return keydir, keyname, keysize, user
-
-    def gen_keys(self, keydir=None, keyname=None, keysize=None, user=None):
-        '''
-        Generate minion RSA public keypair
-        '''
-        keydir, keyname, keysize, user = self._get_key_attrs(keydir, keyname,
-                                                             keysize, user)
-        salt.crypt.gen_keys(keydir, keyname, keysize, user)
-        return salt.utils.pem_finger(os.path.join(keydir, keyname + '.pub'))
-
-    def gen_signature(self, privkey, pubkey, sig_path):
-        '''
-        Generate master public-key-signature
-        '''
-        return salt.crypt.gen_signature(privkey,
-                                        pubkey,
-                                        sig_path)
-
-    def gen_keys_signature(self, priv, pub, signature_path, auto_create=False, keysize=None):
-        '''
-        Generate master public-key-signature
-        '''
-        # check given pub-key
-        if pub:
-            if not os.path.isfile(pub):
-                return 'Public-key {0} does not exist'.format(pub)
-        # default to master.pub
-        else:
-            mpub = self.opts['pki_dir'] + '/' + 'master.pub'
-            if os.path.isfile(mpub):
-                pub = mpub
-
-        # check given priv-key
-        if priv:
-            if not os.path.isfile(priv):
-                return 'Private-key {0} does not exist'.format(priv)
-        # default to master_sign.pem
-        else:
-            mpriv = self.opts['pki_dir'] + '/' + 'master_sign.pem'
-            if os.path.isfile(mpriv):
-                priv = mpriv
-
-        if not priv:
-            if auto_create:
-                log.debug('Generating new signing key-pair {0}.* in {1}'
-                      ''.format(self.opts['master_sign_key_name'],
-                                self.opts['pki_dir']))
-                salt.crypt.gen_keys(self.opts['pki_dir'],
-                                    self.opts['master_sign_key_name'],
-                                    keysize or self.opts['keysize'],
-                                    self.opts.get('user'))
-
-                priv = self.opts['pki_dir'] + '/' + self.opts['master_sign_key_name'] + '.pem'
-            else:
-                return 'No usable private-key found'
-
-        if not pub:
-            return 'No usable public-key found'
-
-        log.debug('Using public-key {0}'.format(pub))
-        log.debug('Using private-key {0}'.format(priv))
-
-        if signature_path:
-            if not os.path.isdir(signature_path):
-                log.debug('target directory {0} does not exist'
-                      ''.format(signature_path))
-        else:
-            signature_path = self.opts['pki_dir']
-
-        sign_path = signature_path + '/' + self.opts['master_pubkey_signature']
-
-        skey = get_key(self.opts)
-        return skey.gen_signature(priv, pub, sign_path)
-
-    def check_minion_cache(self, preserve_minions=None):
-        '''
-        Check the minion cache to make sure that old minion data is cleared
-
-        Optionally, pass in a list of minions which should have their caches
-        preserved. To preserve all caches, set __opts__['preserve_minion_cache']
-        '''
-        if preserve_minions is None:
-            preserve_minions = []
-        keys = self.list_keys()
-        minions = []
-        for key, val in six.iteritems(keys):
-            minions.extend(val)
-        if not self.opts.get('preserve_minion_cache', False) or not preserve_minions:
-            m_cache = os.path.join(self.opts['cachedir'], self.ACC)
-            if os.path.isdir(m_cache):
-                for minion in os.listdir(m_cache):
-                    if minion not in minions and minion not in preserve_minions:
-                        shutil.rmtree(os.path.join(m_cache, minion))
-            cache = salt.cache.Cache(self.opts)
-            clist = cache.list(self.ACC)
-            if clist:
-                for minion in cache.list(self.ACC):
-                    if minion not in minions and minion not in preserve_minions:
-                        cache.flush('{0}/{1}'.format(self.ACC, minion))
-
-    def check_master(self):
-        '''
-        Log if the master is not running
-
-        :rtype: bool
-        :return: Whether or not the master is running
-        '''
-        if not os.path.exists(
-                os.path.join(
-                    self.opts['sock_dir'],
-                    'publish_pull.ipc'
-                    )
-                ):
-            return False
-        return True
-
-    def name_match(self, match, full=False):
-        '''
-        Accept a glob which to match the of a key and return the key's location
-        '''
-        if full:
-            matches = self.all_keys()
-        else:
-            matches = self.list_keys()
-        ret = {}
-        if ',' in match and isinstance(match, str):
-            match = match.split(',')
-        for status, keys in six.iteritems(matches):
-            for key in salt.utils.isorted(keys):
-                if isinstance(match, list):
-                    for match_item in match:
-                        if fnmatch.fnmatch(key, match_item):
-                            if status not in ret:
-                                ret[status] = []
-                            ret[status].append(key)
-                else:
-                    if fnmatch.fnmatch(key, match):
-                        if status not in ret:
-                            ret[status] = []
-                        ret[status].append(key)
-        return ret
-
-    def dict_match(self, match_dict):
-        '''
-        Accept a dictionary of keys and return the current state of the
-        specified keys
-        '''
-        ret = {}
-        cur_keys = self.list_keys()
-        for status, keys in six.iteritems(match_dict):
-            for key in salt.utils.isorted(keys):
-                for keydir in (self.ACC, self.PEND, self.REJ, self.DEN):
-                    if keydir and fnmatch.filter(cur_keys.get(keydir, []), key):
-                        ret.setdefault(keydir, []).append(key)
-        return ret
-
-    def local_keys(self):
-        '''
-        Return a dict of local keys
-        '''
-        ret = {'local': []}
-        for fn_ in salt.utils.isorted(os.listdir(self.opts['pki_dir'])):
-            if fn_.endswith('.pub') or fn_.endswith('.pem'):
-                path = os.path.join(self.opts['pki_dir'], fn_)
-                if os.path.isfile(path):
-                    ret['local'].append(fn_)
-        return ret
-
-    def list_keys(self):
-        '''
-        Return a dict of managed keys and what the key status are
-        '''
-
-        key_dirs = []
-
-        # We have to differentiate between RaetKey._check_minions_directories
-        # and Zeromq-Keys. Raet-Keys only have three states while ZeroMQ-keys
-        # havd an additional 'denied' state.
-        key_dirs = self._check_minions_directories()
-
-        ret = {}
-
-        for dir_ in key_dirs:
-            if dir_ is None:
-                continue
-            ret[os.path.basename(dir_)] = []
-            try:
-                for fn_ in salt.utils.isorted(os.listdir(dir_)):
-                    if not fn_.startswith('.'):
-                        if os.path.isfile(os.path.join(dir_, fn_)):
-                            ret[os.path.basename(dir_)].append(fn_)
-            except (OSError, IOError):
-                # key dir kind is not created yet, just skip
-                continue
-        return ret
-
-    def all_keys(self):
-        '''
-        Merge managed keys with local keys
-        '''
-        keys = self.list_keys()
-        keys.update(self.local_keys())
-        return keys
-
-    def list_status(self, match):
-        '''
-        Return a dict of managed keys under a named status
-        '''
-        acc, pre, rej, den = self._check_minions_directories()
-        ret = {}
-        if match.startswith('acc'):
-            ret[os.path.basename(acc)] = []
-            for fn_ in salt.utils.isorted(os.listdir(acc)):
-                if not fn_.startswith('.'):
-                    if os.path.isfile(os.path.join(acc, fn_)):
-                        ret[os.path.basename(acc)].append(fn_)
-        elif match.startswith('pre') or match.startswith('un'):
-            ret[os.path.basename(pre)] = []
-            for fn_ in salt.utils.isorted(os.listdir(pre)):
-                if not fn_.startswith('.'):
-                    if os.path.isfile(os.path.join(pre, fn_)):
-                        ret[os.path.basename(pre)].append(fn_)
-        elif match.startswith('rej'):
-            ret[os.path.basename(rej)] = []
-            for fn_ in salt.utils.isorted(os.listdir(rej)):
-                if not fn_.startswith('.'):
-                    if os.path.isfile(os.path.join(rej, fn_)):
-                        ret[os.path.basename(rej)].append(fn_)
-        elif match.startswith('den') and den is not None:
-            ret[os.path.basename(den)] = []
-            for fn_ in salt.utils.isorted(os.listdir(den)):
-                if not fn_.startswith('.'):
-                    if os.path.isfile(os.path.join(den, fn_)):
-                        ret[os.path.basename(den)].append(fn_)
-        elif match.startswith('all'):
-            return self.all_keys()
-        return ret
-
-    def key_str(self, match):
-        '''
-        Return the specified public key or keys based on a glob
-        '''
-        ret = {}
-        for status, keys in six.iteritems(self.name_match(match)):
-            ret[status] = {}
-            for key in salt.utils.isorted(keys):
-                path = os.path.join(self.opts['pki_dir'], status, key)
-                with salt.utils.fopen(path, 'r') as fp_:
-                    ret[status][key] = fp_.read()
-        return ret
-
-    def key_str_all(self):
-        '''
-        Return all managed key strings
-        '''
-        ret = {}
-        for status, keys in six.iteritems(self.list_keys()):
-            ret[status] = {}
-            for key in salt.utils.isorted(keys):
-                path = os.path.join(self.opts['pki_dir'], status, key)
-                with salt.utils.fopen(path, 'r') as fp_:
-                    ret[status][key] = fp_.read()
-        return ret
-
-    def accept(self, match=None, match_dict=None, include_rejected=False, include_denied=False):
-        '''
-        Accept public keys. If "match" is passed, it is evaluated as a glob.
-        Pre-gathered matches can also be passed via "match_dict".
-        '''
-        if match is not None:
-            matches = self.name_match(match)
-        elif match_dict is not None and isinstance(match_dict, dict):
-            matches = match_dict
-        else:
-            matches = {}
-        keydirs = [self.PEND]
-        if include_rejected:
-            keydirs.append(self.REJ)
-        if include_denied:
-            keydirs.append(self.DEN)
-        for keydir in keydirs:
-            for key in matches.get(keydir, []):
-                try:
-                    shutil.move(
-                            os.path.join(
-                                self.opts['pki_dir'],
-                                keydir,
-                                key),
-                            os.path.join(
-                                self.opts['pki_dir'],
-                                self.ACC,
-                                key)
-                            )
-                    eload = {'result': True,
-                             'act': 'accept',
-                             'id': key}
-                    self.event.fire_event(eload,
-                                          salt.utils.event.tagify(prefix='key'))
-                except (IOError, OSError):
-                    pass
-        return (
-            self.name_match(match) if match is not None
-            else self.dict_match(matches)
-        )
-
-    def accept_all(self):
-        '''
-        Accept all keys in pre
-        '''
-        keys = self.list_keys()
-        for key in keys[self.PEND]:
-            try:
-                shutil.move(
-                        os.path.join(
-                            self.opts['pki_dir'],
-                            self.PEND,
-                            key),
-                        os.path.join(
-                            self.opts['pki_dir'],
-                            self.ACC,
-                            key)
-                        )
-                eload = {'result': True,
-                         'act': 'accept',
-                         'id': key}
-                self.event.fire_event(eload,
-                                      salt.utils.event.tagify(prefix='key'))
-            except (IOError, OSError):
-                pass
-        return self.list_keys()
-
-    def delete_key(self,
-                    match=None,
-                    match_dict=None,
-                    preserve_minions=False,
-                    revoke_auth=False):
-        '''
-        Delete public keys. If "match" is passed, it is evaluated as a glob.
-        Pre-gathered matches can also be passed via "match_dict".
-
-        To preserve the master caches of minions who are matched, set preserve_minions
-        '''
-        if match is not None:
-            matches = self.name_match(match)
-        elif match_dict is not None and isinstance(match_dict, dict):
-            matches = match_dict
-        else:
-            matches = {}
-        for status, keys in six.iteritems(matches):
-            for key in keys:
-                try:
-                    if revoke_auth:
-                        if self.opts.get('rotate_aes_key') is False:
-                            print('Immediate auth revocation specified but AES key rotation not allowed. '
-                                     'Minion will not be disconnected until the master AES key is rotated.')
-                        else:
-                            try:
-                                client = salt.client.get_local_client(mopts=self.opts)
-                                client.cmd_async(key, 'saltutil.revoke_auth')
-                            except salt.exceptions.SaltClientError:
-                                print('Cannot contact Salt master. '
-                                      'Connection for {0} will remain up until '
-                                      'master AES key is rotated or auth is revoked '
-                                      'with \'saltutil.revoke_auth\'.'.format(key))
-                    os.remove(os.path.join(self.opts['pki_dir'], status, key))
-                    eload = {'result': True,
-                             'act': 'delete',
-                             'id': key}
-                    self.event.fire_event(eload,
-                                          salt.utils.event.tagify(prefix='key'))
-                except (OSError, IOError):
-                    pass
-        if preserve_minions:
-            preserve_minions_list = matches.get('minions', [])
-        else:
-            preserve_minions_list = []
-        self.check_minion_cache(preserve_minions=preserve_minions_list)
-        if self.opts.get('rotate_aes_key'):
-            salt.crypt.dropfile(self.opts['cachedir'], self.opts['user'])
-        return (
-            self.name_match(match) if match is not None
-            else self.dict_match(matches)
-        )
-
-    def delete_den(self):
-        '''
-        Delete all denied keys
-        '''
-        keys = self.list_keys()
-        for status, keys in six.iteritems(self.list_keys()):
-            for key in keys[self.DEN]:
-                try:
-                    os.remove(os.path.join(self.opts['pki_dir'], status, key))
-                    eload = {'result': True,
-                                 'act': 'delete',
-                                 'id': key}
-                    self.event.fire_event(eload,
-                                          salt.utils.event.tagify(prefix='key'))
-                except (OSError, IOError):
-                    pass
-        self.check_minion_cache()
-        return self.list_keys()
-
-    def delete_all(self):
-        '''
-        Delete all keys
-        '''
-        for status, keys in six.iteritems(self.list_keys()):
-            for key in keys:
-                try:
-                    os.remove(os.path.join(self.opts['pki_dir'], status, key))
-                    eload = {'result': True,
-                             'act': 'delete',
-                             'id': key}
-                    self.event.fire_event(eload,
-                                          salt.utils.event.tagify(prefix='key'))
-                except (OSError, IOError):
-                    pass
-        self.check_minion_cache()
-        if self.opts.get('rotate_aes_key'):
-            salt.crypt.dropfile(self.opts['cachedir'], self.opts['user'])
-        return self.list_keys()
-
-    def reject(self, match=None, match_dict=None, include_accepted=False, include_denied=False):
-        '''
-        Reject public keys. If "match" is passed, it is evaluated as a glob.
-        Pre-gathered matches can also be passed via "match_dict".
-        '''
-        if match is not None:
-            matches = self.name_match(match)
-        elif match_dict is not None and isinstance(match_dict, dict):
-            matches = match_dict
-        else:
-            matches = {}
-        keydirs = [self.PEND]
-        if include_accepted:
-            keydirs.append(self.ACC)
-        if include_denied:
-            keydirs.append(self.DEN)
-        for keydir in keydirs:
-            for key in matches.get(keydir, []):
-                try:
-                    shutil.move(
-                            os.path.join(
-                                self.opts['pki_dir'],
-                                keydir,
-                                key),
-                            os.path.join(
-                                self.opts['pki_dir'],
-                                self.REJ,
-                                key)
-                            )
-                    eload = {'result': True,
-                            'act': 'reject',
-                            'id': key}
-                    self.event.fire_event(eload,
-                                          salt.utils.event.tagify(prefix='key'))
-                except (IOError, OSError):
-                    pass
-        self.check_minion_cache()
-        if self.opts.get('rotate_aes_key'):
-            salt.crypt.dropfile(self.opts['cachedir'], self.opts['user'])
-        return (
-            self.name_match(match) if match is not None
-            else self.dict_match(matches)
-        )
-
-    def reject_all(self):
-        '''
-        Reject all keys in pre
-        '''
-        keys = self.list_keys()
-        for key in keys[self.PEND]:
-            try:
-                shutil.move(
-                        os.path.join(
-                            self.opts['pki_dir'],
-                            self.PEND,
-                            key),
-                        os.path.join(
-                            self.opts['pki_dir'],
-                            self.REJ,
-                            key)
-                        )
-                eload = {'result': True,
-                         'act': 'reject',
-                         'id': key}
-                self.event.fire_event(eload,
-                                      salt.utils.event.tagify(prefix='key'))
-            except (IOError, OSError):
-                pass
-        self.check_minion_cache()
-        if self.opts.get('rotate_aes_key'):
-            salt.crypt.dropfile(self.opts['cachedir'], self.opts['user'])
-        return self.list_keys()
-
-    def finger(self, match, hash_type=None):
-        '''
-        Return the fingerprint for a specified key
-        '''
-        if hash_type is None:
-            hash_type = __opts__['hash_type']
-
-        matches = self.name_match(match, True)
-        ret = {}
-        for status, keys in six.iteritems(matches):
-            ret[status] = {}
-            for key in keys:
-                if status == 'local':
-                    path = os.path.join(self.opts['pki_dir'], key)
-                else:
-                    path = os.path.join(self.opts['pki_dir'], status, key)
-                ret[status][key] = salt.utils.pem_finger(path, sum_type=hash_type)
-        return ret
-
-    def finger_all(self, hash_type=None):
-        '''
-        Return fingerprints for all keys
-        '''
-        if hash_type is None:
-            hash_type = __opts__['hash_type']
-
-        ret = {}
-        for status, keys in six.iteritems(self.all_keys()):
-            ret[status] = {}
-            for key in keys:
-                if status == 'local':
-                    path = os.path.join(self.opts['pki_dir'], key)
-                else:
-                    path = os.path.join(self.opts['pki_dir'], status, key)
-                ret[status][key] = salt.utils.pem_finger(path, sum_type=hash_type)
-        return ret
-
-
-class RaetKey(Key):
-    '''
-    Manage keys from the raet backend
-    '''
-    ACC = 'accepted'
-    PEND = 'pending'
-    REJ = 'rejected'
-    DEN = None
-
-    def __init__(self, opts):
-        Key.__init__(self, opts)
-        self.auto_key = salt.daemons.masterapi.AutoKey(self.opts)
-        self.serial = salt.payload.Serial(self.opts)
-
-    def _check_minions_directories(self):
-        '''
-        Return the minion keys directory paths
-        '''
-        accepted = os.path.join(self.opts['pki_dir'], self.ACC)
-        pre = os.path.join(self.opts['pki_dir'], self.PEND)
-        rejected = os.path.join(self.opts['pki_dir'], self.REJ)
-        return accepted, pre, rejected, None
-
-    def check_minion_cache(self, preserve_minions=False):
-        '''
-        Check the minion cache to make sure that old minion data is cleared
-        '''
-        keys = self.list_keys()
-        minions = []
-        for key, val in six.iteritems(keys):
-            minions.extend(val)
-
-        m_cache = os.path.join(self.opts['cachedir'], 'minions')
-        if os.path.isdir(m_cache):
-            for minion in os.listdir(m_cache):
-                if minion not in minions:
-                    shutil.rmtree(os.path.join(m_cache, minion))
-            cache = salt.cache.Cache(self.opts)
-            clist = cache.list(self.ACC)
-            if clist:
-                for minion in cache.list(self.ACC):
-                    if minion not in minions and minion not in preserve_minions:
-                        cache.flush('{0}/{1}'.format(self.ACC, minion))
-
-        kind = self.opts.get('__role', '')  # application kind
-        if kind not in salt.utils.kinds.APPL_KINDS:
-            emsg = ("Invalid application kind = '{0}'.".format(kind))
-            log.error(emsg + '\n')
-            raise ValueError(emsg)
-        role = self.opts.get('id', '')
-        if not role:
-            emsg = ("Invalid id.")
-            log.error(emsg + "\n")
-            raise ValueError(emsg)
-
-        name = "{0}_{1}".format(role, kind)
-        road_cache = os.path.join(self.opts['cachedir'],
-                                  'raet',
-                                  name,
-                                  'remote')
-        if os.path.isdir(road_cache):
-            for road in os.listdir(road_cache):
-                root, ext = os.path.splitext(road)
-                if ext not in ['.json', '.msgpack']:
-                    continue
-                prefix, sep, name = root.partition('.')
-                if not name or prefix != 'estate':
-                    continue
-                path = os.path.join(road_cache, road)
-                with salt.utils.fopen(path, 'rb') as fp_:
-                    if ext == '.json':
-                        data = json.load(fp_)
-                    elif ext == '.msgpack':
-                        data = msgpack.load(fp_)
-                    if data['role'] not in minions:
-                        os.remove(path)
-
-    def gen_keys(self, keydir=None, keyname=None, keysize=None, user=None):
-        '''
-        Use libnacl to generate and safely save a private key
-        '''
-        import libnacl.public
-        d_key = libnacl.dual.DualSecret()
-        keydir, keyname, _, _ = self._get_key_attrs(keydir, keyname,
-                                                    keysize, user)
-        path = '{0}.key'.format(os.path.join(
-            keydir,
-            keyname))
-        d_key.save(path, 'msgpack')
-
-    def check_master(self):
-        '''
-        Log if the master is not running
-        NOT YET IMPLEMENTED
-        '''
-        return True
-
-    def local_keys(self):
-        '''
-        Return a dict of local keys
-        '''
-        ret = {'local': []}
-        fn_ = os.path.join(self.opts['pki_dir'], 'local.key')
-        if os.path.isfile(fn_):
-            ret['local'].append(fn_)
-        return ret
-
-    def status(self, minion_id, pub, verify):
-        '''
-        Accepts the minion id, device id, curve public and verify keys.
-        If the key is not present, put it in pending and return "pending",
-        If the key has been accepted return "accepted"
-        if the key should be rejected, return "rejected"
-        '''
-        acc, pre, rej, _ = self._check_minions_directories()  # pylint: disable=W0632
-        acc_path = os.path.join(acc, minion_id)
-        pre_path = os.path.join(pre, minion_id)
-        rej_path = os.path.join(rej, minion_id)
-        # open mode is turned on, force accept the key
-        keydata = {
-                'minion_id': minion_id,
-                'pub': pub,
-                'verify': verify}
-        if self.opts['open_mode']:  # always accept and overwrite
-            with salt.utils.fopen(acc_path, 'w+b') as fp_:
-                fp_.write(self.serial.dumps(keydata))
-                return self.ACC
-        if os.path.isfile(rej_path):
-            log.debug("Rejection Reason: Keys already rejected.\n")
-            return self.REJ
-        elif os.path.isfile(acc_path):
-            # The minion id has been accepted, verify the key strings
-            with salt.utils.fopen(acc_path, 'rb') as fp_:
-                keydata = self.serial.loads(fp_.read())
-            if keydata['pub'] == pub and keydata['verify'] == verify:
-                return self.ACC
-            else:
-                log.debug("Rejection Reason: Keys not match prior accepted.\n")
-                return self.REJ
-        elif os.path.isfile(pre_path):
-            auto_reject = self.auto_key.check_autoreject(minion_id)
-            auto_sign = self.auto_key.check_autosign(minion_id)
-            with salt.utils.fopen(pre_path, 'rb') as fp_:
-                keydata = self.serial.loads(fp_.read())
-            if keydata['pub'] == pub and keydata['verify'] == verify:
-                if auto_reject:
-                    self.reject(minion_id)
-                    log.debug("Rejection Reason: Auto reject pended.\n")
-                    return self.REJ
-                elif auto_sign:
-                    self.accept(minion_id)
-                    return self.ACC
-                return self.PEND
-            else:
-                log.debug("Rejection Reason: Keys not match prior pended.\n")
-                return self.REJ
-        # This is a new key, evaluate auto accept/reject files and place
-        # accordingly
-        auto_reject = self.auto_key.check_autoreject(minion_id)
-        auto_sign = self.auto_key.check_autosign(minion_id)
-        if self.opts['auto_accept']:
-            w_path = acc_path
-            ret = self.ACC
-        elif auto_sign:
-            w_path = acc_path
-            ret = self.ACC
-        elif auto_reject:
-            w_path = rej_path
-            log.debug("Rejection Reason: Auto reject new.\n")
-            ret = self.REJ
-        else:
-            w_path = pre_path
-            ret = self.PEND
-        with salt.utils.fopen(w_path, 'w+b') as fp_:
-            fp_.write(self.serial.dumps(keydata))
-            return ret
-
-    def _get_key_str(self, minion_id, status):
-        '''
-        Return the key string in the form of:
-
-        pub: <pub>
-        verify: <verify>
-        '''
-        path = os.path.join(self.opts['pki_dir'], status, minion_id)
-        with salt.utils.fopen(path, 'r') as fp_:
-            keydata = self.serial.loads(fp_.read())
-            return 'pub: {0}\nverify: {1}'.format(
-                    keydata['pub'],
-                    keydata['verify'])
-
-    def _get_key_finger(self, path):
-        '''
-        Return a sha256 kingerprint for the key
-        '''
-        with salt.utils.fopen(path, 'r') as fp_:
-            keydata = self.serial.loads(fp_.read())
-            key = 'pub: {0}\nverify: {1}'.format(
-                    keydata['pub'],
-                    keydata['verify'])
-        return hashlib.sha256(key).hexdigest()
-
-    def key_str(self, match):
-        '''
-        Return the specified public key or keys based on a glob
-        '''
-        ret = {}
-        for status, keys in six.iteritems(self.name_match(match)):
-            ret[status] = {}
-            for key in salt.utils.isorted(keys):
-                ret[status][key] = self._get_key_str(key, status)
-        return ret
-
-    def key_str_all(self):
-        '''
-        Return all managed key strings
-        '''
-        ret = {}
-        for status, keys in six.iteritems(self.list_keys()):
-            ret[status] = {}
-            for key in salt.utils.isorted(keys):
-                ret[status][key] = self._get_key_str(key, status)
-        return ret
-
-    def accept(self, match=None, match_dict=None, include_rejected=False, include_denied=False):
-        '''
-        Accept public keys. If "match" is passed, it is evaluated as a glob.
-        Pre-gathered matches can also be passed via "match_dict".
-        '''
-        if match is not None:
-            matches = self.name_match(match)
-        elif match_dict is not None and isinstance(match_dict, dict):
-            matches = match_dict
-        else:
-            matches = {}
-        keydirs = [self.PEND]
-        if include_rejected:
-            keydirs.append(self.REJ)
-        if include_denied:
-            keydirs.append(self.DEN)
-        for keydir in keydirs:
-            for key in matches.get(keydir, []):
-                try:
-                    shutil.move(
-                            os.path.join(
-                                self.opts['pki_dir'],
-                                keydir,
-                                key),
-                            os.path.join(
-                                self.opts['pki_dir'],
-                                self.ACC,
-                                key)
-                            )
-                except (IOError, OSError):
-                    pass
-        return (
-            self.name_match(match) if match is not None
-            else self.dict_match(matches)
-        )
-
-    def accept_all(self):
-        '''
-        Accept all keys in pre
-        '''
-        keys = self.list_keys()
-        for key in keys[self.PEND]:
-            try:
-                shutil.move(
-                        os.path.join(
-                            self.opts['pki_dir'],
-                            self.PEND,
-                            key),
-                        os.path.join(
-                            self.opts['pki_dir'],
-                            self.ACC,
-                            key)
-                        )
-            except (IOError, OSError):
-                pass
-        return self.list_keys()
-
-    def delete_key(self,
-                   match=None,
-                   match_dict=None,
-                   preserve_minions=False,
-                   revoke_auth=False):
-        '''
-        Delete public keys. If "match" is passed, it is evaluated as a glob.
-        Pre-gathered matches can also be passed via "match_dict".
-        '''
-        if match is not None:
-            matches = self.name_match(match)
-        elif match_dict is not None and isinstance(match_dict, dict):
-            matches = match_dict
-        else:
-            matches = {}
-        for status, keys in six.iteritems(matches):
-            for key in keys:
-                if revoke_auth:
-                    if self.opts.get('rotate_aes_key') is False:
-                        print('Immediate auth revocation specified but AES key rotation not allowed. '
-                                 'Minion will not be disconnected until the master AES key is rotated.')
+                    if force_refresh:
+                        log.debug('Grains refresh requested. Refreshing grains.')
                     else:
-                        try:
-                            client = salt.client.get_local_client(mopts=self.opts)
-                            client.cmd_async(key, 'saltutil.revoke_auth')
-                        except salt.exceptions.SaltClientError:
-                            print('Cannot contact Salt master. '
-                                  'Connection for {0} will remain up until '
-                                  'master AES key is rotated or auth is revoked '
-                                  'with \'saltutil.revoke_auth\'.'.format(key))
-                try:
-                    os.remove(os.path.join(self.opts['pki_dir'], status, key))
-                except (OSError, IOError):
-                    pass
-        self.check_minion_cache(preserve_minions=matches.get('minions', []))
-        return (
-            self.name_match(match) if match is not None
-            else self.dict_match(matches)
+                        log.debug('Grains cache last modified {0} seconds ago and '
+                                  'cache expiration is set to {1}. '
+                                  'Grains cache expired. Refreshing.'.format(
+                                      grains_cache_age,
+                                      opts.get('grains_cache_expiration', 300)
+                                  ))
+            else:
+                log.debug('Grains cache file does not exist.')
+
+    if opts.get('skip_grains', False):
+        return {}
+    grains_deep_merge = opts.get('grains_deep_merge', False) is True
+    if 'conf_file' in opts:
+        pre_opts = {}
+        pre_opts.update(salt.config.load_config(
+            opts['conf_file'], 'SALT_MINION_CONFIG',
+            salt.config.DEFAULT_MINION_OPTS['conf_file']
+        ))
+        default_include = pre_opts.get(
+            'default_include', opts['default_include']
         )
-
-    def delete_all(self):
-        '''
-        Delete all keys
-        '''
-        for status, keys in six.iteritems(self.list_keys()):
-            for key in keys:
-                try:
-                    os.remove(os.path.join(self.opts['pki_dir'], status, key))
-                except (OSError, IOError):
-                    pass
-        self.check_minion_cache()
-        return self.list_keys()
-
-    def reject(self, match=None, match_dict=None, include_accepted=False, include_denied=False):
-        '''
-        Reject public keys. If "match" is passed, it is evaluated as a glob.
-        Pre-gathered matches can also be passed via "match_dict".
-        '''
-        if match is not None:
-            matches = self.name_match(match)
-        elif match_dict is not None and isinstance(match_dict, dict):
-            matches = match_dict
+        include = pre_opts.get('include', [])
+        pre_opts.update(salt.config.include_config(
+            default_include, opts['conf_file'], verbose=False
+        ))
+        pre_opts.update(salt.config.include_config(
+            include, opts['conf_file'], verbose=True
+        ))
+        if 'grains' in pre_opts:
+            opts['grains'] = pre_opts['grains']
         else:
-            matches = {}
-        keydirs = [self.PEND]
-        if include_accepted:
-            keydirs.append(self.ACC)
-        if include_denied:
-            keydirs.append(self.DEN)
-        for keydir in keydirs:
-            for key in matches.get(keydir, []):
+            opts['grains'] = {}
+    else:
+        opts['grains'] = {}
+
+    grains_data = {}
+    funcs = grain_funcs(opts, proxy=proxy)
+    if force_refresh:  # if we refresh, lets reload grain modules
+        funcs.clear()
+    # Run core grains
+    for key, fun in six.iteritems(funcs):
+        if not key.startswith('core.'):
+            continue
+        log.trace('Loading {0} grain'.format(key))
+        ret = fun()
+        if not isinstance(ret, dict):
+            continue
+        if grains_deep_merge:
+            salt.utils.dictupdate.update(grains_data, ret)
+        else:
+            grains_data.update(ret)
+
+    # Run the rest of the grains
+    for key, fun in six.iteritems(funcs):
+        if key.startswith('core.') or key == '_errors':
+            continue
+        try:
+            # Grains are loaded too early to take advantage of the injected
+            # __proxy__ variable.  Pass an instance of that LazyLoader
+            # here instead to grains functions if the grains functions take
+            # one parameter.  Then the grains can have access to the
+            # proxymodule for retrieving information from the connected
+            # device.
+            if fun.__code__.co_argcount == 1:
+                ret = fun(proxy)
+            else:
+                ret = fun()
+        except Exception:
+            if is_proxy():
+                log.info('The following CRITICAL message may not be an error; the proxy may not be completely established yet.')
+            log.critical(
+                'Failed to load grains defined in grain file {0} in '
+                'function {1}, error:\n'.format(
+                    key, fun
+                ),
+                exc_info=True
+            )
+            continue
+        if not isinstance(ret, dict):
+            continue
+        if grains_deep_merge:
+            salt.utils.dictupdate.update(grains_data, ret)
+        else:
+            grains_data.update(ret)
+
+    if opts.get('proxy_merge_grains_in_module', True) and proxy:
+        try:
+            proxytype = proxy.opts['proxy']['proxytype']
+            if proxytype+'.grains' in proxy:
+                if proxytype+'.initialized' in proxy and proxy[proxytype+'.initialized']():
+                    try:
+                        proxytype = proxy.opts['proxy']['proxytype']
+                        ret = proxy[proxytype+'.grains']()
+                        if grains_deep_merge:
+                            salt.utils.dictupdate.update(grains_data, ret)
+                        else:
+                            grains_data.update(ret)
+                    except Exception:
+                        log.critical('Failed to run proxy\'s grains function!',
+                            exc_info=True
+                        )
+        except KeyError:
+            pass
+
+    grains_data.update(opts['grains'])
+    # Write cache if enabled
+    if opts.get('grains_cache', False):
+        cumask = os.umask(0o77)
+        try:
+            if salt.utils.is_windows():
+                # Make sure cache file isn't read-only
+                __salt__['cmd.run']('attrib -R "{0}"'.format(cfn))
+            with salt.utils.fopen(cfn, 'w+b') as fp_:
                 try:
-                    shutil.move(
-                            os.path.join(
-                                self.opts['pki_dir'],
-                                keydir,
-                                key),
-                            os.path.join(
-                                self.opts['pki_dir'],
-                                self.REJ,
-                                key)
-                            )
-                except (IOError, OSError):
+                    serial = salt.payload.Serial(opts)
+                    serial.dump(grains_data, fp_)
+                except TypeError:
+                    # Can't serialize pydsl
                     pass
-        self.check_minion_cache()
-        return (
-            self.name_match(match) if match is not None
-            else self.dict_match(matches)
+        except (IOError, OSError):
+            msg = 'Unable to write to grains cache file {0}'
+            log.error(msg.format(cfn))
+        os.umask(cumask)
+
+    if grains_deep_merge:
+        salt.utils.dictupdate.update(grains_data, opts['grains'])
+    else:
+        grains_data.update(opts['grains'])
+    return grains_data
+
+
+# TODO: get rid of? Does anyone use this? You should use raw() instead
+def call(fun, **kwargs):
+    '''
+    Directly call a function inside a loader directory
+    '''
+    args = kwargs.get('args', [])
+    dirs = kwargs.get('dirs', [])
+
+    funcs = LazyLoader(
+        [os.path.join(SALT_BASE_PATH, 'modules')] + dirs,
+        None,
+        tag='modules',
+        virtual_enable=False,
+    )
+    return funcs[fun](*args)
+
+
+def runner(opts, utils=None):
+    '''
+    Directly call a function inside a loader directory
+    '''
+    if utils is None:
+        utils = {}
+    ret = LazyLoader(
+        _module_dirs(opts, 'runners', 'runner', ext_type_dirs='runner_dirs'),
+        opts,
+        tag='runners',
+        pack={'__utils__': utils},
+    )
+    # TODO: change from __salt__ to something else, we overload __salt__ too much
+    ret.pack['__salt__'] = ret
+    return ret
+
+
+def queues(opts):
+    '''
+    Directly call a function inside a loader directory
+    '''
+    return LazyLoader(
+        _module_dirs(opts, 'queues', 'queue', ext_type_dirs='queue_dirs'),
+        opts,
+        tag='queues',
+    )
+
+
+def sdb(opts, functions=None, whitelist=None):
+    '''
+    Make a very small database call
+    '''
+    return LazyLoader(
+        _module_dirs(opts, 'sdb'),
+        opts,
+        tag='sdb',
+        pack={'__sdb__': functions},
+        whitelist=whitelist,
+    )
+
+
+def pkgdb(opts):
+    '''
+    Return modules for SPM's package database
+
+    .. versionadded:: 2015.8.0
+    '''
+    return LazyLoader(
+        _module_dirs(
+            opts,
+            'pkgdb',
+            base_path=os.path.join(SALT_BASE_PATH, 'spm')
+        ),
+        opts,
+        tag='pkgdb'
+    )
+
+
+def pkgfiles(opts):
+    '''
+    Return modules for SPM's file handling
+
+    .. versionadded:: 2015.8.0
+    '''
+    return LazyLoader(
+        _module_dirs(
+            opts,
+            'pkgfiles',
+            base_path=os.path.join(SALT_BASE_PATH, 'spm')
+        ),
+        opts,
+        tag='pkgfiles'
+    )
+
+
+def clouds(opts):
+    '''
+    Return the cloud functions
+    '''
+    # Let's bring __active_provider_name__, defaulting to None, to all cloud
+    # drivers. This will get temporarily updated/overridden with a context
+    # manager when needed.
+    functions = LazyLoader(
+        _module_dirs(opts,
+                     'clouds',
+                     'cloud',
+                     base_path=os.path.join(SALT_BASE_PATH, 'cloud'),
+                     int_type='clouds'),
+        opts,
+        tag='clouds',
+        pack={'__utils__': salt.loader.utils(opts),
+              '__active_provider_name__': None},
+    )
+    for funcname in LIBCLOUD_FUNCS_NOT_SUPPORTED:
+        log.trace(
+            '\'{0}\' has been marked as not supported. Removing from the list '
+            'of supported cloud functions'.format(
+                funcname
+            )
+        )
+        functions.pop(funcname, None)
+    return functions
+
+
+def netapi(opts):
+    '''
+    Return the network api functions
+    '''
+    return LazyLoader(
+        _module_dirs(opts, 'netapi'),
+        opts,
+        tag='netapi',
+    )
+
+
+def executors(opts, functions=None, context=None, proxy=None):
+    '''
+    Returns the executor modules
+    '''
+    return LazyLoader(
+        _module_dirs(opts, 'executors', 'executor'),
+        opts,
+        tag='executor',
+        pack={'__salt__': functions, '__context__': context or {}, '__proxy__': proxy or {}},
+    )
+
+
+def cache(opts, serial):
+    '''
+    Returns the returner modules
+    '''
+    return LazyLoader(
+        _module_dirs(opts, 'cache', 'cache'),
+        opts,
+        tag='cache',
+        pack={'__opts__': opts, '__context__': {'serial': serial}},
+    )
+
+
+def _generate_module(name):
+    if name in sys.modules:
+        return
+
+    code = "'''Salt loaded {0} parent module'''".format(name.split('.')[-1])
+    module = imp.new_module(name)
+    exec(code, module.__dict__)
+    sys.modules[name] = module
+
+
+def _mod_type(module_path):
+    if module_path.startswith(SALT_BASE_PATH):
+        return 'int'
+    return 'ext'
+
+
+# TODO: move somewhere else?
+class FilterDictWrapper(MutableMapping):
+    '''
+    Create a dict which wraps another dict with a specific key suffix on get
+
+    This is to replace "filter_load"
+    '''
+    def __init__(self, d, suffix):
+        self._dict = d
+        self.suffix = suffix
+
+    def __setitem__(self, key, val):
+        self._dict[key] = val
+
+    def __delitem__(self, key):
+        del self._dict[key]
+
+    def __getitem__(self, key):
+        return self._dict[key + self.suffix]
+
+    def __len__(self):
+        return len(self._dict)
+
+    def __iter__(self):
+        for key in self._dict:
+            if key.endswith(self.suffix):
+                yield key.replace(self.suffix, '')
+
+
+class LazyLoader(salt.utils.lazy.LazyDict):
+    '''
+    A pseduo-dictionary which has a set of keys which are the
+    name of the module and function, delimited by a dot. When
+    the value of the key is accessed, the function is then loaded
+    from disk and into memory.
+
+    .. note::
+
+        Iterating over keys will cause all modules to be loaded.
+
+    :param list module_dirs: A list of directories on disk to search for modules
+    :param opts dict: The salt options dictionary.
+    :param tag str': The tag for the type of module to load
+    :param func mod_type_check: A function which can be used to verify files
+    :param dict pack: A dictionary of function to be packed into modules as they are loaded
+    :param list whitelist: A list of modules to whitelist
+    :param bool virtual_enable: Whether or not to respect the __virtual__ function when loading modules.
+    :param str virtual_funcs: The name of additional functions in the module to call to verify its functionality.
+                                If not true, the module will not load.
+    :returns: A LazyLoader object which functions as a dictionary. Keys are 'module.function' and values
+    are function references themselves which are loaded on-demand.
+    # TODO:
+        - move modules_max_memory into here
+        - singletons (per tag)
+    '''
+
+    mod_dict_class = salt.utils.odict.OrderedDict
+
+    def __init__(self,
+                 module_dirs,
+                 opts=None,
+                 tag='module',
+                 loaded_base_name=None,
+                 mod_type_check=None,
+                 pack=None,
+                 whitelist=None,
+                 virtual_enable=True,
+                 static_modules=None,
+                 proxy=None,
+                 virtual_funcs=None,
+                 ):  # pylint: disable=W0231
+        '''
+        In pack, if any of the values are None they will be replaced with an
+        empty context-specific dict
+        '''
+
+        self.inject_globals = {}
+        self.pack = {} if pack is None else pack
+        if opts is None:
+            opts = {}
+        self.context_dict = salt.utils.context.ContextDict()
+        self.opts = self.__prep_mod_opts(opts)
+
+        self.module_dirs = module_dirs
+        self.tag = tag
+        self.loaded_base_name = loaded_base_name or LOADED_BASE_NAME
+        self.mod_type_check = mod_type_check or _mod_type
+
+        if '__context__' not in self.pack:
+            self.pack['__context__'] = None
+
+        for k, v in six.iteritems(self.pack):
+            if v is None:  # if the value of a pack is None, lets make an empty dict
+                self.context_dict.setdefault(k, {})
+                self.pack[k] = salt.utils.context.NamespacedDictWrapper(self.context_dict, k)
+
+        self.whitelist = whitelist
+        self.virtual_enable = virtual_enable
+        self.initial_load = True
+
+        # names of modules that we don't have (errors, __virtual__, etc.)
+        self.missing_modules = {}  # mapping of name -> error
+        self.loaded_modules = {}  # mapping of module_name -> dict_of_functions
+        self.loaded_files = {}  # TODO: just remove them from file_mapping?
+        self.deferred_modules = {} # mapping of virtualname -> realname like pkg -> [pacman, apt]...
+        self.static_modules = static_modules if static_modules else []
+
+        if virtual_funcs is None:
+            virtual_funcs = []
+        self.virtual_funcs = virtual_funcs
+
+        self.disabled = set(self.opts.get('disable_{0}s'.format(self.tag), []))
+
+        self.refresh_file_mapping()
+
+        super(LazyLoader, self).__init__()  # late init the lazy loader
+        # create all of the import namespaces
+        _generate_module('{0}.int'.format(self.loaded_base_name))
+        _generate_module('{0}.int.{1}'.format(self.loaded_base_name, tag))
+        _generate_module('{0}.ext'.format(self.loaded_base_name))
+        _generate_module('{0}.ext.{1}'.format(self.loaded_base_name, tag))
+
+    def __getitem__(self, item):
+        '''
+        Override the __getitem__ in order to decorate the returned function if we need
+        to last-minute inject globals
+        '''
+        func = super(LazyLoader, self).__getitem__(item)
+        if self.inject_globals:
+            return global_injector_decorator(self.inject_globals)(func)
+        else:
+            return func
+
+    def __getattr__(self, mod_name):
+        '''
+        Allow for "direct" attribute access-- this allows jinja templates to
+        access things like `salt.test.ping()`
+        '''
+        # if we have an attribute named that, lets return it.
+        try:
+            return object.__getattr__(self, mod_name)  # pylint: disable=no-member
+        except AttributeError:
+            pass
+
+        # otherwise we assume its jinja template access
+        if mod_name not in self.loaded_modules and not self.loaded:
+            for name in self._iter_files(mod_name):
+                if name in self.loaded_files:
+                    continue
+                # if we got what we wanted, we are done
+                if self._load_module(name) and mod_name in self.loaded_modules:
+                    break
+        if mod_name in self.loaded_modules:
+            return self.loaded_modules[mod_name]
+        else:
+            raise AttributeError(mod_name)
+
+    def missing_fun_string(self, function_name):
+        '''
+        Return the error string for a missing function.
+
+        This can range from "not available' to "__virtual__" returned False
+        '''
+        mod_name = function_name.split('.')[0]
+        if mod_name in self.loaded_modules:
+            return '\'{0}\' is not available.'.format(function_name)
+        else:
+            try:
+                reason = self.missing_modules[mod_name]
+            except KeyError:
+                return '\'{0}\' is not available.'.format(function_name)
+            else:
+                if reason is not None:
+                    return '\'{0}\' __virtual__ returned False: {1}'.format(mod_name, reason)
+                else:
+                    return '\'{0}\' __virtual__ returned False'.format(mod_name)
+
+    def refresh_file_mapping(self):
+        '''
+        refresh the mapping of the FS on disk
+        '''
+        # map of suffix to description for imp
+        self.suffix_map = {}
+        suffix_order = ['']  # local list to determine precedence of extensions
+                             # Prefer packages (directories) over modules (single files)!
+        for (suffix, mode, kind) in SUFFIXES:
+            self.suffix_map[suffix] = (suffix, mode, kind)
+            suffix_order.append(suffix)
+
+        if self.opts.get('cython_enable', True) is True:
+            try:
+                global pyximport
+                pyximport = __import__('pyximport')  # pylint: disable=import-error
+                pyximport.install()
+                # add to suffix_map so file_mapping will pick it up
+                self.suffix_map['.pyx'] = tuple()
+            except ImportError:
+                log.info('Cython is enabled in the options but not present '
+                    'in the system path. Skipping Cython modules.')
+        # Allow for zipimport of modules
+        if self.opts.get('enable_zip_modules', True) is True:
+            self.suffix_map['.zip'] = tuple()
+        # allow for module dirs
+        self.suffix_map[''] = ('', '', imp.PKG_DIRECTORY)
+
+        # create mapping of filename (without suffix) to (path, suffix)
+        # The files are added in order of priority, so order *must* be retained.
+        self.file_mapping = salt.utils.odict.OrderedDict()
+
+        for mod_dir in self.module_dirs:
+            files = []
+            try:
+                files = os.listdir(mod_dir)
+            except OSError:
+                continue  # Next mod_dir
+            for filename in files:
+                try:
+                    if filename.startswith('_'):
+                        # skip private modules
+                        # log messages omitted for obviousness
+                        continue  # Next filename
+                    f_noext, ext = os.path.splitext(filename)
+                    # make sure it is a suffix we support
+                    if ext not in self.suffix_map:
+                        continue  # Next filename
+                    if f_noext in self.disabled:
+                        log.trace(
+                            'Skipping {0}, it is disabled by configuration'.format(
+                            filename
+                            )
+                        )
+                        continue  # Next filename
+                    fpath = os.path.join(mod_dir, filename)
+                    # if its a directory, lets allow us to load that
+                    if ext == '':
+                        # is there something __init__?
+                        subfiles = os.listdir(fpath)
+                        for suffix in suffix_order:
+                            if '' == suffix:
+                                continue  # Next suffix (__init__ must have a suffix)
+                            init_file = '__init__{0}'.format(suffix)
+                            if init_file in subfiles:
+                                break
+                        else:
+                            continue  # Next filename
+
+                    if f_noext in self.file_mapping:
+                        curr_ext = self.file_mapping[f_noext][1]
+                        #log.debug("****** curr_ext={0} ext={1} suffix_order={2}".format(curr_ext, ext, suffix_order))
+                        if '' in (curr_ext, ext) and curr_ext != ext:
+                            log.error(
+                                'Module/package collision: \'%s\' and \'%s\'',
+                                fpath,
+                                self.file_mapping[f_noext][0]
+                            )
+                        if not curr_ext or suffix_order.index(ext) >= suffix_order.index(curr_ext):
+                            continue  # Next filename
+
+                    # Made it this far - add it
+                    self.file_mapping[f_noext] = (fpath, ext)
+
+                except OSError:
+                    continue
+        for smod in self.static_modules:
+            f_noext = smod.split('.')[-1]
+            self.file_mapping[f_noext] = (smod, '.o')
+
+    def clear(self):
+        '''
+        Clear the dict
+        '''
+        
+        super(LazyLoader, self).clear()  # clear the lazy loader
+        self.loaded_files = {}
+        self.missing_modules = {}
+        self.loaded_modules = {}
+        # if we have been loaded before, lets clear the file mapping since
+        # we obviously want a re-do
+        if hasattr(self, 'opts'):
+            self.refresh_file_mapping()
+        self.initial_load = False
+
+    def __prep_mod_opts(self, opts):
+        '''
+        Strip out of the opts any logger instance
+        '''
+        if '__grains__' not in self.pack:
+            self.context_dict['grains'] = opts.get('grains', {})
+            self.pack['__grains__'] = salt.utils.context.NamespacedDictWrapper(self.context_dict, 'grains', override_name='grains')
+
+        if '__pillar__' not in self.pack:
+            self.context_dict['pillar'] = opts.get('pillar', {})
+            self.pack['__pillar__'] = salt.utils.context.NamespacedDictWrapper(self.context_dict, 'pillar', override_name='pillar')
+
+        mod_opts = {}
+        for key, val in list(opts.items()):
+            if key == 'logger':
+                continue
+            mod_opts[key] = val
+        return mod_opts
+
+    def _iter_files(self, mod_name):
+        '''
+        Iterate over all file_mapping files in order of closeness to mod_name
+        '''
+        # do we have an exact match?
+        if mod_name in self.file_mapping:
+            yield mod_name
+
+        # do we have a partial match?
+        for k in self.file_mapping:
+            if mod_name in k:
+                yield k
+
+        # anyone else? Bueller?
+        for k in self.file_mapping:
+            if mod_name not in k:
+                yield k
+
+    def _reload_submodules(self, mod):
+        submodules = (
+            getattr(mod, sname) for sname in dir(mod) if
+            isinstance(getattr(mod, sname), mod.__class__)
         )
 
-    def reject_all(self):
-        '''
-        Reject all keys in pre
-        '''
-        keys = self.list_keys()
-        for key in keys[self.PEND]:
+        # reload only custom "sub"modules
+        for submodule in submodules:
+            # it is a submodule if the name is in a namespace under mod
+            if submodule.__name__.startswith(mod.__name__ + '.'):
+                reload_module(submodule)
+                self._reload_submodules(submodule)
+
+    def _load_module(self, name, requested_name=None):
+        mod = None
+        fpath, suffix = self.file_mapping[name]
+
+
+
+
+        # File loading
+        file_loaded = name in self.loaded_files
+        if file_loaded:
+            mod = self.loaded_files[name]
+
+        if not file_loaded:
+            fpath_dirname = os.path.dirname(fpath)
             try:
-                shutil.move(
-                        os.path.join(
-                            self.opts['pki_dir'],
-                            self.PEND,
-                            key),
-                        os.path.join(
-                            self.opts['pki_dir'],
-                            self.REJ,
-                            key)
+                sys.path.append(fpath_dirname)
+                if suffix == '.pyx':
+                    mod = pyximport.load_module(name, fpath, tempfile.gettempdir())
+                elif suffix == '.o':
+                    top_mod = __import__(fpath, globals(), locals(), [])
+                    comps = fpath.split('.')
+                    if len(comps) < 2:
+                        mod = top_mod
+                    else:
+                        mod = top_mod
+                        for subname in comps[1:]:
+                            mod = getattr(mod, subname)
+                elif suffix == '.zip':
+                    mod = zipimporter(fpath).load_module(name)
+                else:
+                    desc = self.suffix_map[suffix]
+                    # if it is a directory, we don't open a file
+                    if suffix == '':
+                        mod = imp.load_module(
+                            '{0}.{1}.{2}.{3}'.format(
+                                self.loaded_base_name,
+                                self.mod_type_check(fpath),
+                                self.tag,
+                                name
+                            ), None, fpath, desc)
+                        # reload all submodules if necessary
+                        if not self.initial_load:
+                            self._reload_submodules(mod)
+                    else:
+                        with salt.utils.fopen(fpath, desc[1]) as fn_:
+                            mod = imp.load_module(
+                                '{0}.{1}.{2}.{3}'.format(
+                                    self.loaded_base_name,
+                                    self.mod_type_check(fpath),
+                                    self.tag,
+                                    name
+                                ), fn_, fpath, desc)
+
+            except IOError:
+                raise
+            except ImportError as exc:
+                if 'magic number' in str(exc):
+                    error_msg = 'Failed to import {0} {1}. Bad magic number. If migrating from Python2 to Python3, remove all .pyc files and try again.'.format(self.tag, name)
+                    log.warning(error_msg)
+                    self.missing_modules[name] = error_msg
+                log.debug(
+                    'Failed to import {0} {1}:\n'.format(
+                        self.tag, name
+                    ),
+                    exc_info=True
+                )
+                self.missing_modules[name] = exc
+                return False
+            except Exception as error:
+                log.error(
+                    'Failed to import {0} {1}, this is due most likely to a '
+                    'syntax error:\n'.format(
+                        self.tag, name
+                    ),
+                    exc_info=True
+                )
+                self.missing_modules[name] = error
+                return False
+            except SystemExit as error:
+                log.error(
+                    'Failed to import {0} {1} as the module called exit()\n'.format(
+                        self.tag, name
+                    ),
+                    exc_info=True
+                )
+                self.missing_modules[name] = error
+                return False
+            finally:
+                sys.path.remove(fpath_dirname)
+                self.loaded_files[name] = mod
+
+
+        if hasattr(mod, '__opts__'):
+            mod.__opts__.update(self.opts)
+        else:
+            mod.__opts__ = self.opts
+
+        # pack whatever other globals we were asked to
+        for p_name, p_value in six.iteritems(self.pack):
+            setattr(mod, p_name, p_value)
+
+        module_name = mod.__name__.rsplit('.', 1)[-1] # !! THIS IS EXACTLY THE SAME as 'name' - ALWAYS !!
+
+        virtual_name = getattr(mod, '__virtualname__', module_name)
+        # requested: pkg
+        # module_name: (!) pacman
+        # virtual_name: pkg
+        # true and pacman != pkg and 
+
+        if requested_name != None and (virtual_name != requested_name and module_name != requested_name):
+            # Not what we were looking for...so let's cache that for later...and totally don't load
+            # this handles both virtual_name != module_name and virtual_name == module_name
+            # so service = [service, systemd.....]
+            self.deferred_modules.setdefault(virtual_name, [])
+            self.deferred_modules[virtual_name].append(module_name)
+            return False
+
+        #log.info("xxx: loading module " + module_name + " and " + str(requested_name))
+        return self._load_module_finish(mod, module_name, requested_name)
+
+    def _load_module_finish(self, mod, module_name, requested_name):
+        # Call a module's initialization method if it exists
+        module_init = getattr(mod, '__init__', None)
+        name = module_name
+        if inspect.isfunction(module_init):
+            try:
+                module_init(self.opts)
+            except TypeError as e:
+                log.error(e)
+            except Exception:
+                err_string = '__init__ failed'
+                log.debug(
+                    'Error loading {0}.{1}: {2}'.format(
+                        self.tag,
+                        module_name,
+                        err_string),
+                    exc_info=True)
+                self.missing_modules[module_name] = err_string
+                self.missing_modules[name] = err_string
+                return False
+
+        # if virtual modules are enabled, we need to look for the
+        # __virtual__() function inside that module and run it.
+        if self.virtual_enable:
+            virtual_funcs_to_process = ['__virtual__'] + self.virtual_funcs
+            for virtual_func in virtual_funcs_to_process:
+                (virtual_ret, module_name, virtual_err) = self.process_virtual(
+                    mod,
+                    module_name,
+                )
+                if virtual_err is not None:
+                    log.trace('Error loading {0}.{1}: {2}'.format(self.tag,
+                                                                  module_name,
+                                                                  virtual_err,
+                                                                  ))
+
+                # if process_virtual returned a non-True value then we are
+                # supposed to not process this module
+                if virtual_ret is not True and module_name not in self.missing_modules:
+                    # If a module has information about why it could not be loaded, record it
+                    self.missing_modules[module_name] = virtual_err
+                    self.missing_modules[name] = virtual_err
+                if virtual_ret is not True:
+                    return False
+
+        # If this is a proxy minion then MOST modules cannot work. Therefore, require that
+        # any module that does work with salt-proxy-minion define __proxyenabled__ as a list
+        # containing the names of the proxy types that the module supports.
+        #
+        # Render modules and state modules are OK though
+        if 'proxy' in self.opts:
+            if self.tag in ['grains', 'proxy']:
+                if not hasattr(mod, '__proxyenabled__') or \
+                        (self.opts['proxy']['proxytype'] not in mod.__proxyenabled__ and
+                            '*' not in mod.__proxyenabled__):
+                    err_string = 'not a proxy_minion enabled module'
+                    self.missing_modules[module_name] = err_string
+                    self.missing_modules[name] = err_string
+                    return False
+
+        if getattr(mod, '__load__', False) is not False:
+            log.info(
+                'The functions from module \'{0}\' are being loaded from the '
+                'provided __load__ attribute'.format(
+                    module_name
+                )
+            )
+
+        # If we had another module by the same virtual name, we should put any
+        # new functions under the existing dictionary.
+        if module_name in self.loaded_modules:
+            mod_dict = self.loaded_modules[module_name]
+        else:
+            mod_dict = self.mod_dict_class()
+
+        for attr in getattr(mod, '__load__', dir(mod)):
+            if attr.startswith('_'):
+                # private functions are skipped
+                continue
+            func = getattr(mod, attr)
+            if not inspect.isfunction(func):
+                # Not a function!? Skip it!!!
+                continue
+            # Let's get the function name.
+            # If the module has the __func_alias__ attribute, it must be a
+            # dictionary mapping in the form of(key -> value):
+            #   <real-func-name> -> <desired-func-name>
+            #
+            # It default's of course to the found callable attribute name
+            # if no alias is defined.
+            funcname = getattr(mod, '__func_alias__', {}).get(attr, attr)
+            full_funcname = '{0}.{1}'.format(module_name, funcname)
+            # Save many references for lookups
+            # Careful not to overwrite existing (higher priority) functions
+            if full_funcname not in self._dict:
+                self._dict[full_funcname] = func
+            if funcname not in mod_dict:
+                setattr(mod_dict, funcname, func)
+                mod_dict[funcname] = func
+                self._apply_outputter(func, mod)
+
+        # enforce depends
+        try:
+            Depends.enforce_dependencies(self._dict, self.tag)
+        except RuntimeError as exc:
+            log.info('Depends.enforce_dependencies() failed '
+                     'for reasons: {0}'.format(exc))
+
+        self.loaded_modules[module_name] = mod_dict
+        return True
+
+    def _load(self, key):
+        '''
+        Load a single item if you have it
+        '''
+        # if the key doesn't have a '.' then it isn't valid for this mod dict
+        if not isinstance(key, six.string_types) or '.' not in key:
+            raise KeyError
+        mod_name, _ = key.split('.', 1)
+        if mod_name in self.missing_modules:
+            return True
+        # if the modulename isn't in the whitelist, don't bother
+        if self.whitelist and mod_name not in self.whitelist:
+            raise KeyError
+
+        def _inner_load(mod_name):
+            has_deferred = mod_name in self.deferred_modules
+            if has_deferred:
+                # Try again to load the modules, but with the right name :)
+                start_time = time.time()
+                for deferred in self.deferred_modules[mod_name]:
+                    if self._load_module(deferred, mod_name) and key in self._dict:
+                        return True
+
+            # else:
+              #  log.info("xxx: everything failed for " + mod_name)                    
+
+           # start_time = time.time()
+
+            for name in self._iter_files(mod_name):
+                if name in self.loaded_files:
+                    continue
+
+                # if we got what we wanted, we are done
+                self._load_module(name, mod_name)
+                # if key in self._dict:
+                #     return True
+                # This is commented out so it will cache all module names on FIRST CALL
+                #    return True
+            if key in self._dict:
+                return True
+
+            return False
+
+        # try to load the module
+        ret = None
+        reloaded = False
+        # re-scan up to once, IOErrors or a failed load cause re-scans of the
+        # filesystem
+        while True:
+            try:
+                ret = _inner_load(mod_name)
+                if not reloaded and ret is not True:
+                    self.refresh_file_mapping()
+                    reloaded = True
+                    continue
+                break
+            except IOError:
+                if not reloaded:
+                    self.refresh_file_mapping()
+                    reloaded = True
+                continue
+
+        return ret
+
+    def _load_all(self):
+        '''
+        Load all of them
+        '''
+        for name in self.file_mapping:
+            if name in self.loaded_files or name in self.missing_modules:
+                continue
+            self._load_module(name)
+
+        self.loaded = True
+
+    def _apply_outputter(self, func, mod):
+        '''
+        Apply the __outputter__ variable to the functions
+        '''
+        if hasattr(mod, '__outputter__'):
+            outp = mod.__outputter__
+            if func.__name__ in outp:
+                func.__outputter__ = outp[func.__name__]
+
+    def process_virtual(self, mod, module_name, virtual_func='__virtual__'):
+        '''
+        Given a loaded module and its default name determine its virtual name
+
+        This function returns a tuple. The first value will be either True or
+        False and will indicate if the module should be loaded or not (i.e. if
+        it threw and exception while processing its __virtual__ function). The
+        second value is the determined virtual name, which may be the same as
+        the value provided.
+
+        The default name can be calculated as follows::
+
+            module_name = mod.__name__.rsplit('.', 1)[-1]
+        '''
+
+        # The __virtual__ function will return either a True or False value.
+        # If it returns a True value it can also set a module level attribute
+        # named __virtualname__ with the name that the module should be
+        # referred to as.
+        #
+        # This allows us to have things like the pkg module working on all
+        # platforms under the name 'pkg'. It also allows for modules like
+        # augeas_cfg to be referred to as 'augeas', which would otherwise have
+        # namespace collisions. And finally it allows modules to return False
+        # if they are not intended to run on the given platform or are missing
+        # dependencies.
+        try:
+            error_reason = None
+            if hasattr(mod, '__virtual__') and inspect.isfunction(mod.__virtual__):
+                try:
+                    start = time.time()
+                    virtual = getattr(mod, virtual_func)()
+                    if isinstance(virtual, tuple):
+                        error_reason = virtual[1]
+                        virtual = virtual[0]
+                    if self.opts.get('virtual_timer', False):
+                        end = time.time() - start
+                        msg = 'Virtual function took {0} seconds for {1}'.format(
+                                end, module_name)
+                        log.warning(msg)
+                except Exception as exc:
+                    error_reason = ('Exception raised when processing __virtual__ function'
+                              ' for {0}. Module will not be loaded {1}'.format(
+                                  module_name, exc))
+                    log.error(error_reason, exc_info_on_loglevel=logging.DEBUG)
+                    virtual = None
+                # Get the module's virtual name
+                virtualname = getattr(mod, '__virtualname__', virtual)
+                if not virtual:
+                    # if __virtual__() evaluates to False then the module
+                    # wasn't meant for this platform or it's not supposed to
+                    # load for some other reason.
+
+                    # Some modules might accidentally return None and are
+                    # improperly loaded
+                    if virtual is None:
+                        log.warning(
+                            '{0}.__virtual__() is wrongly returning `None`. '
+                            'It should either return `True`, `False` or a new '
+                            'name. If you\'re the developer of the module '
+                            '\'{1}\', please fix this.'.format(
+                                mod.__name__,
+                                module_name
+                            )
                         )
-            except (IOError, OSError):
-                pass
-        self.check_minion_cache()
-        return self.list_keys()
 
-    def finger(self, match, hash_type=None):
-        '''
-        Return the fingerprint for a specified key
-        '''
-        if hash_type is None:
-            hash_type = __opts__['hash_type']
+                    return (False, module_name, error_reason)
 
-        matches = self.name_match(match, True)
-        ret = {}
-        for status, keys in six.iteritems(matches):
-            ret[status] = {}
-            for key in keys:
-                if status == 'local':
-                    path = os.path.join(self.opts['pki_dir'], key)
-                else:
-                    path = os.path.join(self.opts['pki_dir'], status, key)
-                ret[status][key] = self._get_key_finger(path)
-        return ret
+                # At this point, __virtual__ did not return a
+                # boolean value, let's check for deprecated usage
+                # or module renames
+                if virtual is not True and module_name != virtual:
+                    # The module is renaming itself. Updating the module name
+                    # with the new name
+                    log.trace('Loaded {0} as virtual {1}'.format(
+                        module_name, virtual
+                    ))
 
-    def finger_all(self, hash_type=None):
-        '''
-        Return fingerprints for all keys
-        '''
-        if hash_type is None:
-            hash_type = __opts__['hash_type']
+                    if not hasattr(mod, '__virtualname__'):
+                        salt.utils.warn_until(
+                            'Hydrogen',
+                            'The \'{0}\' module is renaming itself in its '
+                            '__virtual__() function ({1} => {2}). Please '
+                            'set it\'s virtual name as the '
+                            '\'__virtualname__\' module attribute. '
+                            'Example: "__virtualname__ = \'{2}\'"'.format(
+                                mod.__name__,
+                                module_name,
+                                virtual
+                            )
+                        )
 
-        ret = {}
-        for status, keys in six.iteritems(self.list_keys()):
-            ret[status] = {}
-            for key in keys:
-                if status == 'local':
-                    path = os.path.join(self.opts['pki_dir'], key)
-                else:
-                    path = os.path.join(self.opts['pki_dir'], status, key)
-                ret[status][key] = self._get_key_finger(path)
-        return ret
+                    if virtualname != virtual:
+                        # The __virtualname__ attribute does not match what's
+                        # being returned by the __virtual__() function. This
+                        # should be considered an error.
+                        log.error(
+                            'The module \'{0}\' is showing some bad usage. Its '
+                            '__virtualname__ attribute is set to \'{1}\' yet the '
+                            '__virtual__() function is returning \'{2}\'. These '
+                            'values should match!'.format(
+                                mod.__name__,
+                                virtualname,
+                                virtual
+                            )
+                        )
 
-    def read_all_remote(self):
-        '''
-        Return a dict of all remote key data
-        '''
-        data = {}
-        for status, mids in six.iteritems(self.list_keys()):
-            for mid in mids:
-                keydata = self.read_remote(mid, status)
-                if keydata:
-                    keydata['acceptance'] = status
-                    data[mid] = keydata
+                    module_name = virtualname
 
-        return data
+                # If the __virtual__ function returns True and __virtualname__
+                # is set then use it
+                elif virtual is True and virtualname != module_name:
+                    if virtualname is not True:
+                        module_name = virtualname
 
-    def read_remote(self, minion_id, status=ACC):
-        '''
-        Read in a remote key of status
-        '''
-        path = os.path.join(self.opts['pki_dir'], status, minion_id)
-        if not os.path.isfile(path):
-            return {}
-        with salt.utils.fopen(path, 'rb') as fp_:
-            return self.serial.loads(fp_.read())
+        except KeyError:
+            # Key errors come out of the virtual function when passing
+            # in incomplete grains sets, these can be safely ignored
+            # and logged to debug, still, it includes the traceback to
+            # help debugging.
+            log.debug(
+                'KeyError when loading {0}'.format(module_name),
+                exc_info=True
+            )
 
-    def read_local(self):
-        '''
-        Read in the local private keys, return an empy dict if the keys do not
-        exist
-        '''
-        path = os.path.join(self.opts['pki_dir'], 'local.key')
-        if not os.path.isfile(path):
-            return {}
-        with salt.utils.fopen(path, 'rb') as fp_:
-            return self.serial.loads(fp_.read())
+        except Exception:
+            # If the module throws an exception during __virtual__()
+            # then log the information and continue to the next.
+            log.error(
+                'Failed to read the virtual function for '
+                '{0}: {1}'.format(
+                    self.tag, module_name
+                ),
+                exc_info=True
+            )
+            return (False, module_name, error_reason)
 
-    def write_local(self, priv, sign):
-        '''
-        Write the private key and the signing key to a file on disk
-        '''
-        keydata = {'priv': priv,
-                   'sign': sign}
-        path = os.path.join(self.opts['pki_dir'], 'local.key')
-        c_umask = os.umask(191)
-        if os.path.exists(path):
-            #mode = os.stat(path).st_mode
-            os.chmod(path, stat.S_IWUSR | stat.S_IRUSR)
-        with salt.utils.fopen(path, 'w+') as fp_:
-            fp_.write(self.serial.dumps(keydata))
-            os.chmod(path, stat.S_IRUSR)
-        os.umask(c_umask)
+        return (True, module_name, None)
 
-    def delete_local(self):
-        '''
-        Delete the local private key file
-        '''
-        path = os.path.join(self.opts['pki_dir'], 'local.key')
-        if os.path.isfile(path):
-            os.remove(path)
 
-    def delete_pki_dir(self):
-        '''
-        Delete the private key directory
-        '''
-        path = self.opts['pki_dir']
-        if os.path.exists(path):
-            shutil.rmtree(path)
+def global_injector_decorator(inject_globals):
+    '''
+    Decorator used by the LazyLoader to inject globals into a function at
+    execute time.
+
+    globals
+        Dictionary with global variables to inject
+    '''
+    def inner_decorator(f):
+        @functools.wraps(f)
+        def wrapper(*args, **kwargs):
+            with salt.utils.context.func_globals_inject(f, **inject_globals):
+                return f(*args, **kwargs)
+        return wrapper
+    return inner_decorator
