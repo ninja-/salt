@@ -970,6 +970,7 @@ class RemoteClient(Client):
             self.auth = self.channel.auth
         else:
             self.auth = ''
+        self.remote_file_list = {} # saltenv is used a key in this dict
 
     def _refresh_channel(self):
         '''
@@ -977,6 +978,10 @@ class RemoteClient(Client):
         '''
         self.channel = salt.transport.Channel.factory(self.opts)
         return self.channel
+
+    def _get_remote_file_list(self, saltenv):
+        self.remote_file_list = self.file_list(self, saltenv, None)
+        print "Remote file list !! => " + ""
 
     def get_file(self,
                  path,
@@ -992,6 +997,7 @@ class RemoteClient(Client):
         cache
         '''
         path, senv = salt.utils.url.split_env(path)
+        print "TEST: stats data = " + self.file_stats(saltenv)
         if senv:
             saltenv = senv
 
@@ -1231,6 +1237,16 @@ class RemoteClient(Client):
                 'cmd': '_file_list'}
 
         return [sdecode(fn_) for fn_ in self.channel.send(load)]
+
+    def file_stats(self, saltenv='base', prefix=''):
+        '''
+        List the files on the master with their stats
+        '''
+        load = {'saltenv': saltenv,
+                'prefix': prefix,
+                'cmd': '_file_stats'}
+
+        return {sdecode(fn_): v for fn_, v in self.channel.send(load)}
 
     def file_list_emptydirs(self, saltenv='base', prefix=''):
         '''
