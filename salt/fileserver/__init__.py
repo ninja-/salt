@@ -762,7 +762,7 @@ class Fileserver(object):
         '''
         Return a list of files from the dominant environment
         '''
-        ret = set()
+        ret = {}
         if 'saltenv' not in load:
             return []
         if not isinstance(load['saltenv'], six.string_types):
@@ -774,11 +774,11 @@ class Fileserver(object):
                 ret.update(self.servers[fstr](load)) # merging dicts here
         # upgrade all set elements to a common encoding
 
-        ret = {salt.utils.locales.sdecode(f): v for f, v in ret}
+        ret = {salt.utils.locales.sdecode(f): v for f, v in ret.items()}
         # some *fs do not handle prefix. Ensure it is filtered
         prefix = load.get('prefix', '').strip('/')
         if prefix != '':
-            ret = {f: v for f, v in ret if f.startswith(prefix)}
+            ret = {f: v for f, v in ret.items() if f.startswith(prefix)}
         return sorted(ret)
 
     def file_list_emptydirs(self, load):
