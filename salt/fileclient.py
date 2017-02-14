@@ -971,7 +971,6 @@ class RemoteClient(Client):
         else:
             self.auth = ''
 
-        self.prefetch = opts.get('prefetch_stats', True)
         self.remote_file_list = {} # saltenv is used a key in this dict
 
     def _refresh_channel(self):
@@ -1011,11 +1010,7 @@ class RemoteClient(Client):
         stats_server = None
         self._get_remote_file_list(saltenv)
 
-        if self.prefetch:
-            stats_server = self.stat_file_try(path, saltenv)
-            # TODO: check if stats_server = False and then replace with hash_and_stat_file
-
-        # hash_server, stat_server = self.hash_and_stat_file(path, saltenv)
+        stats_server = self.stat_file_try(path, saltenv)
 
         # Check if file exists on server, before creating files and
         # directories
@@ -1031,8 +1026,6 @@ class RemoteClient(Client):
         size_server = stats_server[6]
         mode_server = stats_server[0]
 
-        # Hash compare local copy with master and skip download
-        # if no difference found.
         dest2check = dest
         if not dest2check:
             rel_path = self._check_proto(path)
@@ -1050,9 +1043,11 @@ class RemoteClient(Client):
             '\'%s\'', saltenv, dest2check, path
         )
 
+        # Hash compare local copy with master and skip download
+        # if no difference found.
+
         if dest2check and os.path.isfile(dest2check):
-            # TODO remove local hashing to avoid trashing CPU
-            hash_local, stat_local = self.hash_and_stat_file(dest2check, saltenv)
+            hash_local, stat_local = self.stat_file(dest2check, saltenv)
 
             mtime_local = stat_local[8]
             size_local = stat_local[6]
@@ -1081,6 +1076,7 @@ class RemoteClient(Client):
                     log.warning(
                         'Failed to chmod %s: %s', dest2check, exc
                     )
+                return dest2check
 
             if ok:
                 log.info(
@@ -1297,7 +1293,7 @@ class RemoteClient(Client):
                 'cmd': '_file_hash_and_stat'}
         return self.channel.send(load)
 
-    def stat_file_try(self, path, saltenv='base'):
+    def stat_file(self, path, saltenv='base'):
         '''
         '''
         try:
@@ -1311,7 +1307,7 @@ class RemoteClient(Client):
                 return list(os.stat(path))
 
         if saltenv in self.remote_file_list and path in self.remote_file_list[saltenv]:
-            log.warning("Found cached!! xxx")
+            log.debug("*** Found cached stat! for file: " + path)
             return self.remote_file_list[saltenv][path]
 
         return False
