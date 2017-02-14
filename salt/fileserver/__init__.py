@@ -128,7 +128,7 @@ def check_file_list_cache(opts, form, list_cache, w_lock):
                     with salt.utils.fopen(list_cache, 'rb') as fp_:
                         log.trace('Returning file_lists cache data from '
                                   '{0}'.format(list_cache))
-                        return serial.load(fp_).get(form, []), False, False
+                        return serial.load(fp_).get(form, {}), False, False
                 elif _lock_cache(w_lock):
                     # Set the w_lock and go
                     refresh_cache = True
@@ -755,6 +755,30 @@ class Fileserver(object):
         prefix = load.get('prefix', '').strip('/')
         if prefix != '':
             ret = [f for f in ret if f.startswith(prefix)]
+        return sorted(ret)
+
+
+    def file_stats(self, load):
+        '''
+        Return a list of files from the dominant environment
+        '''
+        ret = set()
+        if 'saltenv' not in load:
+            return []
+        if not isinstance(load['saltenv'], six.string_types):
+            load['saltenv'] = six.text_type(load['saltenv'])
+
+        for fsb in self._gen_back(load.pop('fsbackend', None)):
+            fstr = '{0}.file_stats'.format(fsb)
+            if fstr in self.servers:
+                ret.update(self.servers[fstr](load)) # merging dicts here
+        # upgrade all set elements to a common encoding
+
+        ret = {salt.utils.locales.sdecode(f): v for f, v in ret}
+        # some *fs do not handle prefix. Ensure it is filtered
+        prefix = load.get('prefix', '').strip('/')
+        if prefix != '':
+            ret = {f: v for f, v in ret if f.startswith(prefix)}
         return sorted(ret)
 
     def file_list_emptydirs(self, load):
