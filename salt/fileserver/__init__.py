@@ -128,7 +128,7 @@ def check_file_list_cache(opts, form, list_cache, w_lock):
                     with salt.utils.fopen(list_cache, 'rb') as fp_:
                         log.trace('Returning file_lists cache data from '
                                   '{0}'.format(list_cache))
-                        return serial.load(fp_).get(form, {}), False, False
+                        return serial.load(fp_).get(form, []), False, False
                 elif _lock_cache(w_lock):
                     # Set the w_lock and go
                     refresh_cache = True
