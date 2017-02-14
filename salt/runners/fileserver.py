@@ -178,6 +178,11 @@ def file_list(saltenv='base', backend=None):
     load = {'saltenv': saltenv, 'fsbackend': backend}
     return fileserver.file_list(load=load)
 
+def file_stats(saltenv='base', backend=None):
+    fileserver = salt.fileserver.Fileserver(__opts__)
+    load = {'saltenv': saltenv, 'fsbackend': backend}
+    return fileserver.file_stats(load=load)
+
 
 def symlink_list(saltenv='base', backend=None):
     '''

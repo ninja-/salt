@@ -970,6 +970,8 @@ class RemoteClient(Client):
             self.auth = self.channel.auth
         else:
             self.auth = ''
+
+        self.prefetch = opts.get('prefetch_stats', True)
         self.remote_file_list = {} # saltenv is used a key in this dict
 
     def _refresh_channel(self):
@@ -980,8 +982,13 @@ class RemoteClient(Client):
         return self.channel
 
     def _get_remote_file_list(self, saltenv):
-        self.remote_file_list = self.file_list(self, saltenv, None)
-        print "Remote file list !! => " + ""
+        if saltenv in self.remote_file_list:
+            log.info("Using cached file list = " + str(self.remote_file_list[saltenv]))
+        else:
+            log.info("Fetching file list")
+            self.remote_file_list[saltenv] = self.file_stats(saltenv, None)
+
+        return self.remote_file_list[saltenv]
 
     def get_file(self,
                  path,
@@ -997,28 +1004,32 @@ class RemoteClient(Client):
         cache
         '''
         path, senv = salt.utils.url.split_env(path)
-        print "TEST: stats data = " + self.file_stats(saltenv)
+
         if senv:
             saltenv = senv
 
-        if not salt.utils.is_windows():
-            hash_server, stat_server = self.hash_and_stat_file(path, saltenv)
-            try:
-                mode_server = stat_server[0]
-            except (IndexError, TypeError):
-                mode_server = None
-        else:
-            hash_server = self.hash_file(path, saltenv)
-            mode_server = None
+        stats_server = None
+        self._get_remote_file_list(saltenv)
+
+        if self.prefetch:
+            stats_server = self.stat_file_try(path, saltenv)
+            # TODO: check if stats_server = False and then replace with hash_and_stat_file
+
+        # hash_server, stat_server = self.hash_and_stat_file(path, saltenv)
 
         # Check if file exists on server, before creating files and
         # directories
-        if hash_server == '':
+
+        if not stats_server:
             log.debug(
-                'Could not find file \'%s\' in saltenv \'%s\'',
+                '[CACHED] Could not find file \'%s\' in saltenv \'%s\'',
                 path, saltenv
             )
             return False
+
+        mtime_server = stats_server[8]
+        size_server = stats_server[6]
+        mode_server = stats_server[0]
 
         # Hash compare local copy with master and skip download
         # if no difference found.
@@ -1040,59 +1051,43 @@ class RemoteClient(Client):
         )
 
         if dest2check and os.path.isfile(dest2check):
-            if not salt.utils.is_windows():
-                hash_local, stat_local = \
-                    self.hash_and_stat_file(dest2check, saltenv)
-                try:
-                    mode_local = stat_local[0]
-                except (IndexError, TypeError):
-                    mode_local = None
-            else:
-                hash_local = self.hash_file(dest2check, saltenv)
-                mode_local = None
+            # TODO remove local hashing to avoid trashing CPU
+            hash_local, stat_local = self.hash_and_stat_file(dest2check, saltenv)
 
-            if hash_local == hash_server:
-                if not salt.utils.is_windows():
-                    if mode_server is None:
-                        log.debug('No file mode available for \'%s\'', path)
-                    elif mode_local is None:
-                        log.debug(
-                            'No file mode available for \'%s\'',
-                            dest2check
-                        )
-                    else:
-                        if mode_server == mode_local:
-                            log.info(
-                                'Fetching file from saltenv \'%s\', '
-                                '** skipped ** latest already in cache '
-                                '\'%s\', mode up-to-date', saltenv, path
-                            )
-                        else:
-                            try:
-                                os.chmod(dest2check, mode_server)
-                                log.info(
-                                    'Fetching file from saltenv \'%s\', '
-                                    '** updated ** latest already in cache, '
-                                    '\'%s\', mode updated from %s to %s',
-                                    saltenv,
-                                    path,
-                                    salt.utils.st_mode_to_octal(mode_local),
-                                    salt.utils.st_mode_to_octal(mode_server)
-                                )
-                            except OSError as exc:
-                                log.warning(
-                                    'Failed to chmod %s: %s', dest2check, exc
-                                )
-                    # We may not have been able to check/set the mode, but we
-                    # don't want to re-download the file because of a failure
-                    # in mode checking. Return the cached path.
-                    return dest2check
-                else:
+            mtime_local = stat_local[8]
+            size_local = stat_local[6]
+            mode_local = stat_local[0]
+
+            mtime_delta = mtime_server - mtime_local # if delta is > 0 then the file on the server was updated
+            size_ok = ( size_local == size_server )
+            log.debug("Sizes: " + str(size_local) + " " + str(size_server) )
+            log.debug("Delta:  " + str(mtime_delta))
+
+            ok = mtime_delta <= 0 and size_ok # this is similar to how rsync would work
+
+            if ok and not salt.utils.is_windows() and mode_server != mode_local:
+                try:
+                    os.chmod(dest2check, mode_server)
                     log.info(
-                        'Fetching file from saltenv \'%s\', ** skipped ** '
-                        'latest already in cache \'%s\'', saltenv, path
+                        'Fetching file from saltenv \'%s\', '
+                        '** updated ** latest already in cache, '
+                        '\'%s\', mode updated from %s to %s',
+                        saltenv,
+                        path,
+                        salt.utils.st_mode_to_octal(mode_local),
+                        salt.utils.st_mode_to_octal(mode_server)
                     )
-                    return dest2check
+                except OSError as exc:
+                    log.warning(
+                        'Failed to chmod %s: %s', dest2check, exc
+                    )
+
+            if ok:
+                log.info(
+                    'Fetching file from saltenv \'%s\', ** skipped ** '
+                    'latest already in cache \'%s\'', saltenv, path
+                )
+                return dest2check
 
         log.debug(
             'Fetching file from saltenv \'%s\', ** attempting ** \'%s\'',
@@ -1300,6 +1295,25 @@ class RemoteClient(Client):
                 'saltenv': saltenv,
                 'cmd': '_file_hash_and_stat'}
         return self.channel.send(load)
+
+    def stat_file_try(self, path, saltenv='base'):
+        '''
+        '''
+        try:
+            path = self._check_proto(path)
+        except MinionError as err:
+            if not os.path.isfile(path):
+                msg = 'specified file {0} is not present to check stats: {1}'
+                log.warning(msg.format(path, err))
+                return []
+            else:
+                return list(os.stat(path))
+
+        if saltenv in self.remote_file_list and path in self.remote_file_list[saltenv]:
+            log.warning("Found cached!! xxx")
+            return self.remote_file_list[saltenv][path]
+
+        return False
 
     def hash_file(self, path, saltenv='base'):
         '''
