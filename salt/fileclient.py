@@ -982,9 +982,9 @@ class RemoteClient(Client):
 
     def _get_remote_file_list(self, saltenv):
         if saltenv in self.remote_file_list:
-            log.info("Using cached file list = " + str(self.remote_file_list[saltenv]))
+            log.debug("Using cached file list for saltenv {0}".format(saltenv))
         else:
-            log.info("Fetching file list")
+            log.debug("Fetching remote file list for saltenv {0}".format(saltenv))
             self.remote_file_list[saltenv] = self.file_stats(saltenv, None)
 
         return self.remote_file_list[saltenv]
@@ -1007,10 +1007,9 @@ class RemoteClient(Client):
         if senv:
             saltenv = senv
 
-        stats_server = None
         self._get_remote_file_list(saltenv)
 
-        stats_server = self.stat_file_try(path, saltenv)
+        stat_server = self.stat_file_try(path, saltenv)
 
         # Check if file exists on server, before creating files and
         # directories
@@ -1022,9 +1021,9 @@ class RemoteClient(Client):
             )
             return False
 
-        mtime_server = stats_server[8]
-        size_server = stats_server[6]
-        mode_server = stats_server[0]
+        mtime_server = stat_server[8]
+        size_server = stat_server[6]
+        mode_server = stat_server[0]
 
         dest2check = dest
         if not dest2check:
@@ -1043,7 +1042,7 @@ class RemoteClient(Client):
             '\'%s\'', saltenv, dest2check, path
         )
 
-        # Hash compare local copy with master and skip download
+        # Compare local copy with master and skip download
         # if no difference found.
 
         if dest2check and os.path.isfile(dest2check):
@@ -1055,8 +1054,7 @@ class RemoteClient(Client):
 
             mtime_delta = mtime_server - mtime_local # if delta is > 0 then the file on the server was updated
             size_ok = ( size_local == size_server )
-            log.debug("Sizes: " + str(size_local) + " " + str(size_server) )
-            log.debug("Delta:  " + str(mtime_delta))
+            log.debug("File sizes server/client: {0}, {1}, mtime delta = {2}".format(size_local, size_server, mtime_delta))
 
             ok = mtime_delta <= 0 and size_ok # this is similar to how rsync would work
 
