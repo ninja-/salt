@@ -779,7 +779,7 @@ class Fileserver(object):
         prefix = load.get('prefix', '').strip('/')
         if prefix != '':
             ret = {f: v for f, v in ret.items() if f.startswith(prefix)}
-        return sorted(ret)
+        return ret
 
     def file_list_emptydirs(self, load):
         '''

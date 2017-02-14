@@ -1245,6 +1245,7 @@ class RemoteClient(Client):
         if not ret:
             return ret
 
+
         return {sdecode(fn_): v for fn_, v in ret.items()}
 
     def file_list_emptydirs(self, saltenv='base', prefix=''):
