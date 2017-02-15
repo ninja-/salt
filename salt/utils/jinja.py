@@ -68,7 +68,7 @@ class SaltCacheLoader(BaseLoader):
 
         pillar = kwargs['pillar_rend']
         key = (pillar,)
-        inst = cls._singletons.get[key]
+        inst = cls._singletons.get(key)
         if inst:
             return inst
 
