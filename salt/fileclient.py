@@ -1369,6 +1369,7 @@ class FSClient(RemoteClient):
         self.opts = opts
         self.channel = salt.fileserver.FSChan(opts)
         self.auth = DumbAuth()
+        self.remote_file_list = {}
 
 
 class DumbAuth(object):
