@@ -1009,7 +1009,7 @@ class RemoteClient(Client):
 
         self._get_remote_file_list(saltenv)
 
-        stat_server = self.stat_file_try(path, saltenv)
+        stat_server = self.stat_file(path, saltenv)
 
         # Check if file exists on server, before creating files and
         # directories
