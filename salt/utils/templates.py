@@ -271,7 +271,7 @@ def _get_jinja_error(trace, context=None):
 def render_jinja_tmpl(tmplstr, context, tmplpath=None):
     opts = context['opts']
     saltenv = context['saltenv']
-    loader = None
+    loader = context.get('loader')
     newline = False
 
     if tmplstr and not isinstance(tmplstr, six.text_type):
@@ -291,8 +291,9 @@ def render_jinja_tmpl(tmplstr, context, tmplpath=None):
             #   http://jinja.pocoo.org/docs/api/#jinja2.FileSystemLoader
             loader = jinja2.FileSystemLoader(
                 context, os.path.dirname(tmplpath))
-    else:
+    elif not loader:
         loader = salt.utils.jinja.SaltCacheLoader(opts, saltenv, pillar_rend=context.get('_pillar_rend', False))
+        context['loader'] = loader
 
     env_args = {'extensions': [], 'loader': loader}
 
