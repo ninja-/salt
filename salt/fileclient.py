@@ -1046,7 +1046,7 @@ class RemoteClient(Client):
         # if no difference found.
 
         if dest2check and os.path.isfile(dest2check):
-            hash_local, stat_local = self.stat_file(dest2check, saltenv)
+            stat_local = self.stat_file(dest2check, saltenv)
 
             mtime_local = stat_local[8]
             size_local = stat_local[6]
