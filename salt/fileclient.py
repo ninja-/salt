@@ -985,7 +985,7 @@ class RemoteClient(Client):
             log.debug("Using cached file list for saltenv {0}".format(saltenv))
         else:
             log.debug("Fetching remote file list for saltenv {0}".format(saltenv))
-            self.remote_file_list[saltenv] = self.file_stats(saltenv, None)
+            self.remote_file_list[saltenv] = self.file_stats(saltenv)
 
         return self.remote_file_list[saltenv]
 
