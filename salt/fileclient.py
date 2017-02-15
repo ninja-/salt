@@ -985,7 +985,10 @@ class RemoteClient(Client):
             log.debug("Using cached file list for saltenv {0}".format(saltenv))
         else:
             log.debug("Fetching remote file list for saltenv {0}".format(saltenv))
-            self.remote_file_list[saltenv] = self.file_stats(saltenv)
+            res = self.file_stats(saltenv)
+            if res:
+                self.remote_file_list[saltenv] = res
+            return res
 
         return self.remote_file_list[saltenv]
 
@@ -1007,12 +1010,15 @@ class RemoteClient(Client):
         if senv:
             saltenv = senv
 
-        self._get_remote_file_list(saltenv)
+        cached_list = self._get_remote_file_list(saltenv) # TODO check if returned false
 
-        stat_server = self.stat_file(path, saltenv)
+        stat_server = self.stat_file(path, saltenv) # gets information only from cached list
 
-        # Check if file exists on server, before creating files and
-        # directories
+        # if cached_list is non empty, we know that all used filesystems
+        # support extended file stats and there's no need to check hashes
+        if not cached_list:
+            # if the fs backend doesn't support _file_stats, use old _file_find
+            hash_server, stat_server = self.hash_and_stat_file(path, saltenv)
 
         if not stat_server:
             log.debug(
@@ -1021,9 +1027,13 @@ class RemoteClient(Client):
             )
             return False
 
-        mtime_server = stat_server[8]
-        size_server = stat_server[6]
+        # Some fs like gitfs does not support extended file stats yet
+        # In such case we need to fallback to comparing file hashes
+        support_mtime = len(stat_server) > 8
         mode_server = stat_server[0]
+        if support_mtime
+            mtime_server = stat_server[8]
+            size_server = stat_server[6]
 
         dest2check = dest
         if not dest2check:
@@ -1046,17 +1056,28 @@ class RemoteClient(Client):
         # if no difference found.
 
         if dest2check and os.path.isfile(dest2check):
-            stat_local = self.stat_file(dest2check, saltenv)
+            # stat local file
 
+            if support_mtime:
+                stat_local = self.stat_file(dest2check, saltenv)
+            else:
+                stat_local, hash_local = self.hash_and_stat_file(dest2check, saltenv)
+
+            mode_local = stat_local[0]
             mtime_local = stat_local[8]
             size_local = stat_local[6]
-            mode_local = stat_local[0]
 
-            mtime_delta = mtime_server - mtime_local # if delta is > 0 then the file on the server was updated
-            size_ok = ( size_local == size_server )
-            log.debug("File sizes server/client: {0}, {1}, mtime delta = {2}".format(size_local, size_server, mtime_delta))
+            if support_mtime:
+                # Compare dates of modification and size
+                mtime_delta = mtime_server - mtime_local # if delta is > 0 then the file on the server was updated
+                size_ok = ( size_local == size_server )
+                log.debug("File sizes server/client: {0}, {1}, mtime delta = {2}".format(size_local, size_server, mtime_delta))
 
-            ok = mtime_delta <= 0 and size_ok # this is similar to how rsync would work
+                ok = mtime_delta <= 0 and size_ok # this is similar to how rsync would work
+            else:
+                # Compare hashes
+                log.debug("File hashes server/client {0}, {1}", hash_server, hash_local)
+                ok = ( hash_server == hash_local )
 
             if ok and not salt.utils.is_windows() and mode_server != mode_local:
                 try:
