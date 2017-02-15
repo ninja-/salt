@@ -686,11 +686,11 @@ def set_auth_key(
             new_file = False
 
         try:
-            with salt.utils.fopen(fconfig, 'a+') as _fh:
+            with salt.utils.fopen(fconfig, 'ba+') as _fh:
                 if new_file is False:
                     # Let's make sure we have a new line at the end of the file
                     _fh.seek(1024, 2)
-                    if not _fh.read(1024).rstrip(' ').endswith('\n'):
+                    if not _fh.read(1024).decpde().rstrip(' ').endswith('\n'):
                         _fh.seek(0, 2)
                         _fh.write(b'\n')
                 _fh.write('{0}'.format(auth_line).encode())
