@@ -1033,7 +1033,7 @@ class RemoteClient(Client):
         # In such case we need to fallback to comparing file hashes
         support_mtime = len(stat_server) > 8
         mode_server = stat_server[0]
-        if support_mtime
+        if support_mtime:
             mtime_server = stat_server[8]
             size_server = stat_server[6]
 
