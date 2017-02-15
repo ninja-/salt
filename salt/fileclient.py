@@ -1014,7 +1014,7 @@ class RemoteClient(Client):
         # Check if file exists on server, before creating files and
         # directories
 
-        if not stats_server:
+        if not stat_server:
             log.debug(
                 '[CACHED] Could not find file \'%s\' in saltenv \'%s\'',
                 path, saltenv
