@@ -692,8 +692,8 @@ def set_auth_key(
                     _fh.seek(1024, 2)
                     if not _fh.read(1024).rstrip(' ').endswith('\n'):
                         _fh.seek(0, 2)
-                        _fh.write('\n')
-                _fh.write('{0}'.format(auth_line))
+                        _fh.write(b'\n')
+                _fh.write('{0}'.format(auth_line).encode())
         except (IOError, OSError) as exc:
             msg = 'Could not write to key file: {0}'
             raise CommandExecutionError(msg.format(str(exc)))
