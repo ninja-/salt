@@ -514,7 +514,7 @@ def __discover_version(saltstack_version):
         try:
             return SaltStackVersion.parse(out)
         except ValueError:
-            if not SaltStackVersion.git_sha_regex.match(out):
+            if not SaltStackVersion.git_sha_regex.match(out.decode()):
                 raise
 
             # We only define the parsed SHA and set NOC as ??? (unknown)
