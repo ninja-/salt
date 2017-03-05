@@ -1655,9 +1655,10 @@ class State(object):
         '''
         tag = _gen_tag(low)
         try:
-            ret = self.states[cdata['full']](*cdata['args'],
+            ret = {'start_timestamp': datetime.datetime.now().timestamp()}
+            ret_state = self.states[cdata['full']](*cdata['args'],
                                              **cdata['kwargs'])
-            ret.update({'start_timestamp': datetime.datetime.now().timestamp()})
+            ret.update(ret_state)
         except Exception:
             trb = traceback.format_exc()
             ret = {
